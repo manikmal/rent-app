@@ -1,0 +1,10 @@
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+backend/__pycache__/
+frontend/node_modules/
+frontend/build/
+data/

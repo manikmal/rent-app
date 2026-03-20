@@ -1,0 +1,23 @@
+services:
+  backend:
+    build: ./backend
+    container_name: rent-backend
+    ports:
+      - "8000:8000"
+    environment:
+      DATA_DIR: /data
+      OLLAMA_URL: http://host.docker.internal:11434/api/generate
+      OLLAMA_MODEL: llama3
+    volumes:
+      - rent_data:/data
+
+  frontend:
+    build: ./frontend
+    container_name: rent-frontend
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+
+volumes:
+  rent_data:
