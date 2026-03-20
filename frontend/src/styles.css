@@ -7,6 +7,7 @@
   --accent-soft: #d7ebe6;
   --late: #c75146;
   --paid: #2a7f62;
+  --partial: #9a6c17;
   --pending: #b9812e;
   --border: rgba(30, 42, 47, 0.12);
   --shadow: 0 18px 50px rgba(49, 46, 40, 0.12);
@@ -141,6 +142,16 @@ button:disabled {
   border: 1px solid var(--border);
 }
 
+.result-matcher {
+  margin-top: 14px;
+}
+
+.helper-text {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
 pre {
   margin: 0;
   white-space: pre-wrap;
@@ -180,6 +191,11 @@ td {
 .status.pending {
   background: rgba(185, 129, 46, 0.16);
   color: var(--pending);
+}
+
+.status.partially_paid {
+  background: rgba(154, 108, 23, 0.16);
+  color: var(--partial);
 }
 
 .status.late {

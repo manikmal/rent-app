@@ -22,7 +22,7 @@ Minimal rent management system with lease parsing, rent tracking, payment matchi
 2. Start the app:
 
    ```bash
-   docker-compose up --build
+   ./scripts/docker-up.sh
    ```
 
 3. Open:
@@ -43,3 +43,4 @@ Minimal rent management system with lease parsing, rent tracking, payment matchi
 - `tenant_name` and `rent_amount` are provided manually during lease upload.
 - Lease metadata is extracted from the PDF text through Ollama.
 - Payment message parsing uses regex only for amount, date, and tenant key extraction.
+- If plain `docker compose up --build` fails with a `~/.docker/buildx` permission error on this machine, use `./scripts/docker-up.sh`. It uses a temporary Docker config and disables BuildKit for this project only, so no `sudo` is required.
