@@ -330,6 +330,100 @@ function App() {
       {error && <div className="banner error">{error}</div>}
       {notice && <div className="banner success">{notice}</div>}
 
+      {showTenantForm && (
+        <section className="surface editor-surface editor-surface-inline">
+          <div className="section-head">
+            <div>
+              <p className="section-kicker">Editor</p>
+              <h2>{tenantForm.id ? "Edit tenant" : "Add tenant"}</h2>
+            </div>
+            <button type="button" className="ghost-button" onClick={resetTenantEditor} disabled={loading}>
+              Close
+            </button>
+          </div>
+
+          <form onSubmit={handleTenantSave} className="editor-form">
+            <label className="field">
+              Tenant name
+              <input
+                value={tenantForm.tenantName}
+                onChange={(e) =>
+                  setTenantForm((current) => ({
+                    ...current,
+                    tenantName: e.target.value,
+                  }))
+                }
+                required
+              />
+            </label>
+
+            <label className="field">
+              Rent amount
+              <input
+                type="number"
+                step="0.01"
+                value={tenantForm.rentAmount}
+                onChange={(e) =>
+                  setTenantForm((current) => ({
+                    ...current,
+                    rentAmount: e.target.value,
+                  }))
+                }
+                required
+              />
+            </label>
+
+            <label className="field">
+              Due day
+              <input
+                type="number"
+                min="1"
+                max="31"
+                value={tenantForm.rentDueDay}
+                onChange={(e) =>
+                  setTenantForm((current) => ({
+                    ...current,
+                    rentDueDay: e.target.value,
+                  }))
+                }
+              />
+            </label>
+
+            <label className="field">
+              Lease start
+              <input
+                type="date"
+                value={tenantForm.leaseStart}
+                onChange={(e) =>
+                  setTenantForm((current) => ({
+                    ...current,
+                    leaseStart: e.target.value,
+                  }))
+                }
+              />
+            </label>
+
+            <label className="field">
+              Lease end
+              <input
+                type="date"
+                value={tenantForm.leaseEnd}
+                onChange={(e) =>
+                  setTenantForm((current) => ({
+                    ...current,
+                    leaseEnd: e.target.value,
+                  }))
+                }
+              />
+            </label>
+
+            <button type="submit" className="primary-wide" disabled={loading}>
+              {loading ? "Saving..." : tenantForm.id ? "Save changes" : "Create tenant"}
+            </button>
+          </form>
+        </section>
+      )}
+
       <section className="metrics-grid">
         {metrics.map((metric) => (
           <article key={metric.label} className={`metric-card tone-${metric.tone}`}>
@@ -340,100 +434,6 @@ function App() {
       </section>
 
       <main className="dashboard-grid">
-        {showTenantForm && (
-          <section className="surface editor-surface editor-surface-inline">
-            <div className="section-head">
-              <div>
-                <p className="section-kicker">Editor</p>
-                <h2>{tenantForm.id ? "Edit tenant" : "Add tenant"}</h2>
-              </div>
-              <button type="button" className="ghost-button" onClick={resetTenantEditor} disabled={loading}>
-                Close
-              </button>
-            </div>
-
-            <form onSubmit={handleTenantSave} className="editor-form">
-              <label className="field">
-                Tenant name
-                <input
-                  value={tenantForm.tenantName}
-                  onChange={(e) =>
-                    setTenantForm((current) => ({
-                      ...current,
-                      tenantName: e.target.value,
-                    }))
-                  }
-                  required
-                />
-              </label>
-
-              <label className="field">
-                Rent amount
-                <input
-                  type="number"
-                  step="0.01"
-                  value={tenantForm.rentAmount}
-                  onChange={(e) =>
-                    setTenantForm((current) => ({
-                      ...current,
-                      rentAmount: e.target.value,
-                    }))
-                  }
-                  required
-                />
-              </label>
-
-              <label className="field">
-                Due day
-                <input
-                  type="number"
-                  min="1"
-                  max="31"
-                  value={tenantForm.rentDueDay}
-                  onChange={(e) =>
-                    setTenantForm((current) => ({
-                      ...current,
-                      rentDueDay: e.target.value,
-                    }))
-                  }
-                />
-              </label>
-
-              <label className="field">
-                Lease start
-                <input
-                  type="date"
-                  value={tenantForm.leaseStart}
-                  onChange={(e) =>
-                    setTenantForm((current) => ({
-                      ...current,
-                      leaseStart: e.target.value,
-                    }))
-                  }
-                />
-              </label>
-
-              <label className="field">
-                Lease end
-                <input
-                  type="date"
-                  value={tenantForm.leaseEnd}
-                  onChange={(e) =>
-                    setTenantForm((current) => ({
-                      ...current,
-                      leaseEnd: e.target.value,
-                    }))
-                  }
-                />
-              </label>
-
-              <button type="submit" className="primary-wide" disabled={loading}>
-                {loading ? "Saving..." : tenantForm.id ? "Save changes" : "Create tenant"}
-              </button>
-            </form>
-          </section>
-        )}
-
         <section className="surface command-center">
           <div className="section-head">
             <div>
