@@ -1,15 +1,10 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import "./styles.css";
 
 const API_BASE = process.env.REACT_APP_API_BASE || "http://localhost:8000";
 
-const emptyUploadForm = {
-  tenantName: "",
-  rentAmount: "",
-  file: null,
-};
-
-const emptyManualTenantForm = {
+const emptyTenantForm = {
+  id: null,
   tenantName: "",
   rentAmount: "",
   rentDueDay: "",
@@ -17,16 +12,63 @@ const emptyManualTenantForm = {
   leaseEnd: "",
 };
 
+function toTenantForm(property) {
+  return {
+    id: property?.id ?? null,
+    tenantName: property?.tenant_name ?? "",
+    rentAmount: property?.rent_amount ?? "",
+    rentDueDay: property?.rent_due_day ?? "",
+    leaseStart: property?.lease_start ?? "",
+    leaseEnd: property?.lease_end ?? "",
+  };
+}
+
+function formatCurrency(value) {
+  return `Rs. ${Number(value || 0).toLocaleString("en-IN", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })}`;
+}
+
+function metricRows(properties, unmatchedPayments) {
+  const totalExpected = properties.reduce((sum, item) => sum + Number(item.rent_amount || 0), 0);
+  const totalCollected = properties.reduce(
+    (sum, item) => sum + Number(item.current_month_paid_amount || 0),
+    0
+  );
+  const totalOutstanding = properties.reduce(
+    (sum, item) => sum + Number(item.balance_amount || 0),
+    0
+  );
+  const totalSurplus = properties.reduce(
+    (sum, item) => sum + Number(item.surplus_amount || 0),
+    0
+  );
+  const needsAttention = properties.filter((item) =>
+    ["LATE", "PARTIALLY_PAID", "SURPLUS"].includes(item.status)
+  ).length;
+
+  return [
+    { label: "Expected this month", value: formatCurrency(totalExpected), tone: "sand" },
+    { label: "Collected", value: formatCurrency(totalCollected), tone: "mint" },
+    { label: "Outstanding", value: formatCurrency(totalOutstanding), tone: "amber" },
+    { label: "Surplus", value: formatCurrency(totalSurplus), tone: "blue" },
+    { label: "Unmatched payments", value: String(unmatchedPayments.length), tone: "coral" },
+    { label: "Needs attention", value: String(needsAttention), tone: "ink" },
+  ];
+}
+
 function App() {
   const [properties, setProperties] = useState([]);
   const [unmatchedPayments, setUnmatchedPayments] = useState([]);
-  const [uploadForm, setUploadForm] = useState(emptyUploadForm);
-  const [manualTenantForm, setManualTenantForm] = useState(emptyManualTenantForm);
-  const [uploadResult, setUploadResult] = useState(null);
+  const [selectedTenant, setSelectedTenant] = useState(null);
+  const [tenantForm, setTenantForm] = useState(emptyTenantForm);
+  const [showTenantForm, setShowTenantForm] = useState(false);
   const [paymentMessage, setPaymentMessage] = useState("");
   const [paymentResult, setPaymentResult] = useState(null);
   const [manualSelections, setManualSelections] = useState({});
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
   const [loading, setLoading] = useState(false);
 
   const loadData = async () => {
@@ -53,35 +95,104 @@ function App() {
     loadData();
   }, []);
 
-  const handleUpload = async (event) => {
+  const metrics = useMemo(
+    () => metricRows(properties, unmatchedPayments),
+    [properties, unmatchedPayments]
+  );
+
+  const attentionItems = useMemo(
+    () =>
+      properties.filter((item) => ["LATE", "PARTIALLY_PAID", "SURPLUS"].includes(item.status)),
+    [properties]
+  );
+
+  const resetTenantEditor = () => {
+    setTenantForm(emptyTenantForm);
+    setShowTenantForm(false);
+  };
+
+  const openTenantDetails = (property) => {
+    setSelectedTenant(property);
+  };
+
+  const openNewTenantForm = () => {
+    setError("");
+    setNotice("");
+    setTenantForm(emptyTenantForm);
+    setShowTenantForm(true);
+  };
+
+  const startEditingTenant = (property) => {
+    setError("");
+    setNotice("");
+    setTenantForm(toTenantForm(property));
+    setShowTenantForm(true);
+  };
+
+  const handleTenantSave = async (event) => {
     event.preventDefault();
-    if (!uploadForm.file) {
-      setError("Please choose a PDF lease file.");
+    setLoading(true);
+    setError("");
+    setNotice("");
+
+    try {
+      const payload = {
+        tenant_name: tenantForm.tenantName,
+        rent_amount: Number(tenantForm.rentAmount),
+        rent_due_day: tenantForm.rentDueDay ? Number(tenantForm.rentDueDay) : null,
+        lease_start: tenantForm.leaseStart || null,
+        lease_end: tenantForm.leaseEnd || null,
+      };
+
+      const isEditing = Boolean(tenantForm.id);
+      const response = await fetch(
+        isEditing ? `${API_BASE}/properties/${tenantForm.id}` : `${API_BASE}/properties`,
+        {
+          method: isEditing ? "PUT" : "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        }
+      );
+      const result = await response.json();
+      if (!response.ok) {
+        throw new Error(result.detail || "Could not save tenant.");
+      }
+
+      setNotice(isEditing ? "Tenant updated." : "Tenant added.");
+      resetTenantEditor();
+      await loadData();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleDeleteTenant = async (property) => {
+    if (!window.confirm(`Delete ${property.tenant_name}?`)) {
       return;
     }
 
     setLoading(true);
     setError("");
-    setUploadResult(null);
+    setNotice("");
 
     try {
-      const formData = new FormData();
-      formData.append("file", uploadForm.file);
-      formData.append("tenant_name", uploadForm.tenantName);
-      formData.append("rent_amount", uploadForm.rentAmount);
-
-      const response = await fetch(`${API_BASE}/upload-lease`, {
-        method: "POST",
-        body: formData,
+      const response = await fetch(`${API_BASE}/properties/${property.id}`, {
+        method: "DELETE",
       });
-
       const result = await response.json();
       if (!response.ok) {
-        throw new Error(result.detail || "Lease upload failed.");
+        throw new Error(result.detail || "Could not delete tenant.");
       }
 
-      setUploadResult(result);
-      setUploadForm(emptyUploadForm);
+      if (tenantForm.id === property.id) {
+        resetTenantEditor();
+      }
+      if (selectedTenant?.id === property.id) {
+        setSelectedTenant(null);
+      }
+      setNotice("Tenant deleted.");
       await loadData();
     } catch (err) {
       setError(err.message);
@@ -93,6 +204,7 @@ function App() {
   const handlePaymentProcess = async () => {
     setLoading(true);
     setError("");
+    setNotice("");
     setPaymentResult(null);
 
     try {
@@ -116,84 +228,7 @@ function App() {
     }
   };
 
-  const handleManualTenantCreate = async (event) => {
-    event.preventDefault();
-    setLoading(true);
-    setError("");
-    setUploadResult(null);
-
-    try {
-      const response = await fetch(`${API_BASE}/properties`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          tenant_name: manualTenantForm.tenantName,
-          rent_amount: Number(manualTenantForm.rentAmount),
-          rent_due_day: manualTenantForm.rentDueDay ? Number(manualTenantForm.rentDueDay) : null,
-          lease_start: manualTenantForm.leaseStart || null,
-          lease_end: manualTenantForm.leaseEnd || null,
-        }),
-      });
-      const result = await response.json();
-      if (!response.ok) {
-        throw new Error(result.detail || "Could not add tenant.");
-      }
-
-      setUploadResult(result);
-      setManualTenantForm(emptyManualTenantForm);
-      await loadData();
-    } catch (err) {
-      setError(err.message);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleManualMatch = async (unmatchedPayment) => {
-    const propertyId = manualSelections[unmatchedPayment.id];
-    if (!propertyId) {
-      setError("Please select a property for manual matching.");
-      return;
-    }
-
-    setLoading(true);
-    setError("");
-
-    try {
-      const response = await fetch(`${API_BASE}/manual-match`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          property_id: Number(propertyId),
-          amount: unmatchedPayment.amount,
-          date: unmatchedPayment.payment_date,
-          unmatched_payment_id: unmatchedPayment.id,
-          sender_key: unmatchedPayment.sender_key || null,
-        }),
-      });
-      const result = await response.json();
-      if (!response.ok) {
-        throw new Error(result.detail || "Manual match failed.");
-      }
-
-      setPaymentResult(result);
-      await loadData();
-    } catch (err) {
-      setError(err.message);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const paymentResultSelectionKey =
-    paymentResult?.status === "UNMATCHED" ? `payment-result-${paymentResult.unmatched_payment_id}` : null;
-
-  const handlePaymentResultMatch = async () => {
-    if (!paymentResultSelectionKey || paymentResult?.status !== "UNMATCHED") {
-      return;
-    }
-
-    const propertyId = manualSelections[paymentResultSelectionKey];
+  const savePaymentMatch = async ({ selectionKey, propertyId, amount, date, unmatchedPaymentId, senderKey }) => {
     if (!propertyId) {
       setError("Please select a tenant to match this payment.");
       return;
@@ -201,6 +236,7 @@ function App() {
 
     setLoading(true);
     setError("");
+    setNotice("");
 
     try {
       const response = await fetch(`${API_BASE}/manual-match`, {
@@ -208,10 +244,10 @@ function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           property_id: Number(propertyId),
-          amount: paymentResult.amount,
-          date: paymentResult.date,
-          unmatched_payment_id: paymentResult.unmatched_payment_id,
-          sender_key: paymentResult.sender_key || null,
+          amount,
+          date,
+          unmatched_payment_id: unmatchedPaymentId,
+          sender_key: senderKey || null,
         }),
       });
       const result = await response.json();
@@ -219,7 +255,12 @@ function App() {
         throw new Error(result.detail || "Manual match failed.");
       }
 
+      setManualSelections((current) => ({
+        ...current,
+        [selectionKey]: "",
+      }));
       setPaymentResult(result);
+      setNotice("Payment matched.");
       await loadData();
     } catch (err) {
       setError(err.message);
@@ -228,313 +269,454 @@ function App() {
     }
   };
 
+  const renderPaymentMatcher = (payment, selectionKey) => (
+    <div className="matcher-inline">
+      <select
+        value={manualSelections[selectionKey] || ""}
+        onChange={(e) =>
+          setManualSelections((current) => ({
+            ...current,
+            [selectionKey]: e.target.value,
+          }))
+        }
+      >
+        <option value="">Choose tenant</option>
+        {(payment.candidates?.length > 0 ? payment.candidates : properties).map((property) => (
+          <option key={property.id} value={property.id}>
+            {property.tenant_name} • {formatCurrency(property.rent_amount)}
+          </option>
+        ))}
+      </select>
+      <button
+        type="button"
+        onClick={() =>
+          savePaymentMatch({
+            selectionKey,
+            propertyId: manualSelections[selectionKey],
+            amount: payment.amount,
+            date: payment.date || payment.payment_date,
+            unmatchedPaymentId: payment.unmatched_payment_id || payment.id,
+            senderKey: payment.sender_key,
+          })
+        }
+        disabled={loading}
+      >
+        Match
+      </button>
+    </div>
+  );
+
+  const selectedTenantFresh =
+    selectedTenant && properties.find((property) => property.id === selectedTenant.id);
+
   return (
     <div className="app-shell">
       <header className="hero">
-        <div>
-          <p className="eyebrow">Rent Management System</p>
-          <h1>Lease parsing, rent tracking, and payment correction.</h1>
+        <div className="hero-copy-wrap">
+          <p className="eyebrow">Rent Desk</p>
+          <h1>Rent collection first. Everything else stays out of the way.</h1>
           <p className="hero-copy">
-            Upload leases, track rent status, process bank messages, and manually
-            resolve unmatched payments.
+            Track what is due, what has landed, who needs attention, and match incoming
+            payments without jumping between forms.
           </p>
+        </div>
+        <div className="hero-cta">
+          <button type="button" onClick={openNewTenantForm} disabled={loading}>
+            Add Tenant
+          </button>
         </div>
       </header>
 
-      {error && <div className="alert error">{error}</div>}
+      {error && <div className="banner error">{error}</div>}
+      {notice && <div className="banner success">{notice}</div>}
 
-      <main className="grid">
-        <section className="card">
-          <h2>Upload Lease</h2>
-          <form onSubmit={handleUpload} className="stack">
-            <label>
-              Tenant Name
-              <input
-                value={uploadForm.tenantName}
-                onChange={(e) =>
-                  setUploadForm((current) => ({
-                    ...current,
-                    tenantName: e.target.value,
-                  }))
-                }
-                required
-              />
-            </label>
-            <label>
-              Rent Amount
-              <input
-                type="number"
-                step="0.01"
-                value={uploadForm.rentAmount}
-                onChange={(e) =>
-                  setUploadForm((current) => ({
-                    ...current,
-                    rentAmount: e.target.value,
-                  }))
-                }
-                required
-              />
-            </label>
-            <label>
-              Lease PDF
-              <input
-                type="file"
-                accept="application/pdf"
-                onChange={(e) =>
-                  setUploadForm((current) => ({
-                    ...current,
-                    file: e.target.files[0] || null,
-                  }))
-                }
-                required
-              />
-            </label>
-            <button type="submit" disabled={loading}>
-              {loading ? "Working..." : "Upload Lease"}
-            </button>
-          </form>
+      <section className="metrics-grid">
+        {metrics.map((metric) => (
+          <article key={metric.label} className={`metric-card tone-${metric.tone}`}>
+            <p>{metric.label}</p>
+            <strong>{metric.value}</strong>
+          </article>
+        ))}
+      </section>
 
-          {uploadResult && (
-            <div className="result">
-              <h3>Extracted Data</h3>
-              <pre>{JSON.stringify(uploadResult, null, 2)}</pre>
+      <main className="dashboard-grid">
+        {showTenantForm && (
+          <section className="surface editor-surface editor-surface-inline">
+            <div className="section-head">
+              <div>
+                <p className="section-kicker">Editor</p>
+                <h2>{tenantForm.id ? "Edit tenant" : "Add tenant"}</h2>
+              </div>
+              <button type="button" className="ghost-button" onClick={resetTenantEditor} disabled={loading}>
+                Close
+              </button>
             </div>
-          )}
-        </section>
 
-        <section className="card">
-          <h2>Add Tenant Without Lease</h2>
-          <form onSubmit={handleManualTenantCreate} className="stack">
-            <label>
-              Tenant Name
-              <input
-                value={manualTenantForm.tenantName}
-                onChange={(e) =>
-                  setManualTenantForm((current) => ({
-                    ...current,
-                    tenantName: e.target.value,
-                  }))
-                }
-                required
-              />
-            </label>
-            <label>
-              Amount Due
-              <input
-                type="number"
-                step="0.01"
-                value={manualTenantForm.rentAmount}
-                onChange={(e) =>
-                  setManualTenantForm((current) => ({
-                    ...current,
-                    rentAmount: e.target.value,
-                  }))
-                }
-                required
-              />
-            </label>
-            <label>
-              Due Day (Optional)
-              <input
-                type="number"
-                min="1"
-                max="31"
-                value={manualTenantForm.rentDueDay}
-                onChange={(e) =>
-                  setManualTenantForm((current) => ({
-                    ...current,
-                    rentDueDay: e.target.value,
-                  }))
-                }
-              />
-            </label>
-            <label>
-              Lease Start (Optional)
-              <input
-                type="date"
-                value={manualTenantForm.leaseStart}
-                onChange={(e) =>
-                  setManualTenantForm((current) => ({
-                    ...current,
-                    leaseStart: e.target.value,
-                  }))
-                }
-              />
-            </label>
-            <label>
-              Lease End (Optional)
-              <input
-                type="date"
-                value={manualTenantForm.leaseEnd}
-                onChange={(e) =>
-                  setManualTenantForm((current) => ({
-                    ...current,
-                    leaseEnd: e.target.value,
-                  }))
-                }
-              />
-            </label>
-            <button type="submit" disabled={loading}>
-              {loading ? "Working..." : "Add Tenant"}
-            </button>
-          </form>
-        </section>
+            <form onSubmit={handleTenantSave} className="editor-form">
+              <label className="field">
+                Tenant name
+                <input
+                  value={tenantForm.tenantName}
+                  onChange={(e) =>
+                    setTenantForm((current) => ({
+                      ...current,
+                      tenantName: e.target.value,
+                    }))
+                  }
+                  required
+                />
+              </label>
 
-        <section className="card wide">
-          <h2>Dashboard</h2>
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Tenant Name</th>
-                  <th>Rent Amount</th>
-                  <th>Paid This Month</th>
-                  <th>Balance</th>
-                  <th>Due Day</th>
-                  <th>Lease Start</th>
-                  <th>Lease End</th>
-                  <th>Status</th>
-                  <th>Last Paid Date</th>
-                </tr>
-              </thead>
-              <tbody>
-                {properties.length === 0 ? (
-                  <tr>
-                    <td colSpan="9">No properties yet.</td>
-                  </tr>
-                ) : (
-                  properties.map((property) => (
-                    <tr key={property.id}>
-                      <td>{property.tenant_name}</td>
-                      <td>{property.rent_amount}</td>
-                      <td>{property.current_month_paid_amount || 0}</td>
-                      <td>{property.balance_amount ?? property.rent_amount}</td>
-                      <td>{property.rent_due_day || "-"}</td>
-                      <td>{property.lease_start || "-"}</td>
-                      <td>{property.lease_end || "-"}</td>
-                      <td>
-                        <span className={`status ${property.status.toLowerCase()}`}>
-                          {property.status}
-                        </span>
-                      </td>
-                      <td>{property.last_paid_date || "-"}</td>
-                    </tr>
-                  ))
-                )}
-              </tbody>
-            </table>
+              <label className="field">
+                Rent amount
+                <input
+                  type="number"
+                  step="0.01"
+                  value={tenantForm.rentAmount}
+                  onChange={(e) =>
+                    setTenantForm((current) => ({
+                      ...current,
+                      rentAmount: e.target.value,
+                    }))
+                  }
+                  required
+                />
+              </label>
+
+              <label className="field">
+                Due day
+                <input
+                  type="number"
+                  min="1"
+                  max="31"
+                  value={tenantForm.rentDueDay}
+                  onChange={(e) =>
+                    setTenantForm((current) => ({
+                      ...current,
+                      rentDueDay: e.target.value,
+                    }))
+                  }
+                />
+              </label>
+
+              <label className="field">
+                Lease start
+                <input
+                  type="date"
+                  value={tenantForm.leaseStart}
+                  onChange={(e) =>
+                    setTenantForm((current) => ({
+                      ...current,
+                      leaseStart: e.target.value,
+                    }))
+                  }
+                />
+              </label>
+
+              <label className="field">
+                Lease end
+                <input
+                  type="date"
+                  value={tenantForm.leaseEnd}
+                  onChange={(e) =>
+                    setTenantForm((current) => ({
+                      ...current,
+                      leaseEnd: e.target.value,
+                    }))
+                  }
+                />
+              </label>
+
+              <button type="submit" className="primary-wide" disabled={loading}>
+                {loading ? "Saving..." : tenantForm.id ? "Save changes" : "Create tenant"}
+              </button>
+            </form>
+          </section>
+        )}
+
+        <section className="surface command-center">
+          <div className="section-head">
+            <div>
+              <p className="section-kicker">Payment Desk</p>
+              <h2>Process incoming payment text</h2>
+            </div>
           </div>
-        </section>
 
-        <section className="card">
-          <h2>Process Payment</h2>
-          <label className="stack">
-            Bank Message
+          <label className="field">
+            Bank message
             <textarea
-              rows="5"
+              rows="6"
               value={paymentMessage}
               onChange={(e) => setPaymentMessage(e.target.value)}
-              placeholder='ICICI Bank Account XX112 credited:Rs. 1,80,374.64 on 12-Mar-26. Info NEFT-HSBCN07127765530-RISHI'
+              placeholder="Paste the credited NEFT message here"
             />
           </label>
-          <button onClick={handlePaymentProcess} disabled={loading || !paymentMessage.trim()}>
+
+          <button
+            type="button"
+            className="primary-wide"
+            onClick={handlePaymentProcess}
+            disabled={loading || !paymentMessage.trim()}
+          >
             {loading ? "Working..." : "Process Payment"}
           </button>
 
-          {paymentResult && (
-            <div className="result">
-              <h3>Payment Result</h3>
-              {paymentResult.matched_property && (
-                <p className="helper-text">
-                  Status: <strong>{paymentResult.status}</strong>
-                  {" | "}Paid this month:{" "}
-                  <strong>{paymentResult.current_month_paid_amount ?? 0}</strong>
-                  {" | "}Balance: <strong>{paymentResult.balance_amount ?? 0}</strong>
-                </p>
-              )}
-              <pre>{JSON.stringify(paymentResult, null, 2)}</pre>
-              {paymentResult.status === "UNMATCHED" && (
-                <div className="stack result-matcher">
-                  <p className="helper-text">
-                    New sender key <strong>{paymentResult.sender_key || "unknown"}</strong>.
-                    Match it once and future payments from the same NEFT sender will auto-map.
-                  </p>
-                  <select
-                    value={manualSelections[paymentResultSelectionKey] || ""}
-                    onChange={(e) =>
-                      setManualSelections((current) => ({
-                        ...current,
-                        [paymentResultSelectionKey]: e.target.value,
-                      }))
-                    }
-                  >
-                    <option value="">Select tenant</option>
-                    {(paymentResult.candidates.length > 0
-                      ? paymentResult.candidates
-                      : properties
-                    ).map((property) => (
-                      <option key={property.id} value={property.id}>
-                        {property.tenant_name} (#{property.id})
-                      </option>
-                    ))}
-                  </select>
-                  <button onClick={handlePaymentResultMatch} disabled={loading}>
-                    Save Match For This Sender
-                  </button>
+          {paymentResult ? (
+            <div className="payment-card">
+              <div className="payment-topline">
+                <span className={`status-pill status-${paymentResult.status.toLowerCase()}`}>
+                  {paymentResult.status.replaceAll("_", " ")}
+                </span>
+                {paymentResult.amount != null && <strong>{formatCurrency(paymentResult.amount)}</strong>}
+              </div>
+
+              {paymentResult.matched_property ? (
+                <div className="payment-summary">
+                  <p>{paymentResult.matched_property.tenant_name}</p>
+                  <span>Paid this month: {formatCurrency(paymentResult.current_month_paid_amount)}</span>
+                  <span>Balance: {formatCurrency(paymentResult.balance_amount)}</span>
+                  <span>Surplus: {formatCurrency(paymentResult.surplus_amount)}</span>
+                </div>
+              ) : (
+                <div className="payment-summary">
+                  <p>Manual match needed</p>
+                  <span>
+                    {paymentResult.matching_hint || "We could not confidently identify this payment."}
+                  </span>
                 </div>
               )}
+
+              {paymentResult.status === "UNMATCHED" &&
+                renderPaymentMatcher(paymentResult, `payment-result-${paymentResult.unmatched_payment_id}`)}
+            </div>
+          ) : (
+            <div className="empty-note">
+              Payments you process will show a match result, balance, and surplus here.
             </div>
           )}
         </section>
 
-        <section className="card wide">
-          <h2>Manual Matching</h2>
-          {unmatchedPayments.length === 0 ? (
-            <p>No unmatched payments.</p>
+        <section className="surface sidebar-panel">
+          <div className="section-head">
+            <div>
+              <p className="section-kicker">Attention</p>
+              <h2>What needs action</h2>
+            </div>
+          </div>
+
+          {attentionItems.length === 0 ? (
+            <div className="empty-note">Everything looks settled right now.</div>
           ) : (
-            <div className="stack">
-              {unmatchedPayments.map((payment) => (
-                <div key={payment.id} className="unmatched-card">
-                  <div className="unmatched-meta">
-                    <p>
-                      <strong>Tenant Key:</strong> {payment.extracted_tenant_name || "N/A"}
-                    </p>
-                    <p>
-                      <strong>Sender Key:</strong> {payment.sender_key || "N/A"}
-                    </p>
-                    <p>
-                      <strong>Amount:</strong> {payment.amount}
-                    </p>
-                    <p>
-                      <strong>Date:</strong> {payment.payment_date}
-                    </p>
+            <div className="attention-list">
+              {attentionItems.map((item) => (
+                <button
+                  key={item.id}
+                  type="button"
+                  className="attention-item"
+                  onClick={() => openTenantDetails(item)}
+                >
+                  <div>
+                    <strong>{item.tenant_name}</strong>
+                    <span>{item.status.replaceAll("_", " ")}</span>
                   </div>
-                  <select
-                    value={manualSelections[payment.id] || ""}
-                    onChange={(e) =>
-                      setManualSelections((current) => ({
-                        ...current,
-                        [payment.id]: e.target.value,
-                      }))
-                    }
-                  >
-                    <option value="">Select property</option>
-                    {(payment.candidates.length > 0 ? payment.candidates : properties).map(
-                      (property) => (
-                        <option key={property.id} value={property.id}>
-                          {property.tenant_name} (#{property.id})
-                        </option>
-                      )
-                    )}
-                  </select>
-                  <button onClick={() => handleManualMatch(payment)} disabled={loading}>
-                    Confirm Match
-                  </button>
-                </div>
+                  <small>{formatCurrency(item.balance_amount || item.surplus_amount || 0)}</small>
+                </button>
+              ))}
+            </div>
+          )}
+
+          <div className="section-head compact">
+            <div>
+              <p className="section-kicker">Unmatched</p>
+              <h2>Payments inbox</h2>
+            </div>
+          </div>
+
+          {unmatchedPayments.length === 0 ? (
+            <div className="empty-note">No unmatched payments waiting.</div>
+          ) : (
+            <div className="inbox-list">
+              {unmatchedPayments.map((payment) => (
+                <article key={payment.id} className="inbox-item">
+                  <div className="inbox-head">
+                    <strong>{formatCurrency(payment.amount)}</strong>
+                    <span>{payment.payment_date}</span>
+                  </div>
+                  <p>Sender: {payment.sender_key || "Unknown"}</p>
+                  <p>Hint: {payment.extracted_tenant_name || "No hint"}</p>
+                  {renderPaymentMatcher(payment, `unmatched-${payment.id}`)}
+                </article>
               ))}
             </div>
           )}
         </section>
+
+        <section className="surface roster-surface">
+          <div className="section-head">
+            <div>
+              <p className="section-kicker">Roster</p>
+              <h2>Tenant accounts</h2>
+            </div>
+          </div>
+
+          {properties.length === 0 ? (
+            <div className="empty-note">No tenants yet. Start by adding one.</div>
+          ) : (
+            <div className="tenant-grid">
+              {properties.map((property) => (
+                <article
+                  key={property.id}
+                  className={`tenant-card ${selectedTenantFresh?.id === property.id ? "selected" : ""}`}
+                  onClick={() => openTenantDetails(property)}
+                >
+                  <div className="tenant-card-head">
+                    <div>
+                      <h3>{property.tenant_name}</h3>
+                      <span className={`status-pill status-${property.status.toLowerCase()}`}>
+                        {property.status.replaceAll("_", " ")}
+                      </span>
+                    </div>
+                    <div className="tenant-actions">
+                      <button
+                        type="button"
+                        className="ghost-button"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          startEditingTenant(property);
+                        }}
+                        disabled={loading}
+                      >
+                        Edit
+                      </button>
+                      <button
+                        type="button"
+                        className="ghost-danger"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          handleDeleteTenant(property);
+                        }}
+                        disabled={loading}
+                      >
+                        Delete
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="tenant-finance">
+                    <div>
+                      <p>Monthly rent</p>
+                      <strong>{formatCurrency(property.rent_amount)}</strong>
+                    </div>
+                    <div>
+                      <p>Collected</p>
+                      <strong>{formatCurrency(property.current_month_paid_amount)}</strong>
+                    </div>
+                    <div>
+                      <p>Balance</p>
+                      <strong>{formatCurrency(property.balance_amount)}</strong>
+                    </div>
+                    <div>
+                      <p>Surplus</p>
+                      <strong>{formatCurrency(property.surplus_amount)}</strong>
+                    </div>
+                  </div>
+
+                  <div className="tenant-meta">
+                    <span>Due day: {property.rent_due_day || "Not set"}</span>
+                    <span>Lease start: {property.lease_start || "Not set"}</span>
+                    <span>Lease end: {property.lease_end || "Not set"}</span>
+                    <span>Last paid: {property.last_paid_date || "No payment yet"}</span>
+                  </div>
+                </article>
+              ))}
+            </div>
+          )}
+        </section>
+
+        {selectedTenantFresh && (
+          <section className="surface detail-surface">
+            <div className="section-head">
+              <div>
+                <p className="section-kicker">Tenant Detail</p>
+                <h2>{selectedTenantFresh.tenant_name}</h2>
+              </div>
+              <button
+                type="button"
+                className="ghost-button"
+                onClick={() => setSelectedTenant(null)}
+                disabled={loading}
+              >
+                Close
+              </button>
+            </div>
+
+            <div className="detail-hero">
+              <span className={`status-pill status-${selectedTenantFresh.status.toLowerCase()}`}>
+                {selectedTenantFresh.status.replaceAll("_", " ")}
+              </span>
+              <strong>{formatCurrency(selectedTenantFresh.rent_amount)}</strong>
+              <p>Monthly rent</p>
+            </div>
+
+            <div className="detail-grid">
+              <article className="detail-card">
+                <p>Collected this month</p>
+                <strong>{formatCurrency(selectedTenantFresh.current_month_paid_amount)}</strong>
+              </article>
+              <article className="detail-card">
+                <p>Outstanding balance</p>
+                <strong>{formatCurrency(selectedTenantFresh.balance_amount)}</strong>
+              </article>
+              <article className="detail-card">
+                <p>Surplus held</p>
+                <strong>{formatCurrency(selectedTenantFresh.surplus_amount)}</strong>
+              </article>
+              <article className="detail-card">
+                <p>Due day</p>
+                <strong>{selectedTenantFresh.rent_due_day || "Not set"}</strong>
+              </article>
+            </div>
+
+            <div className="ledger-card">
+              <div className="ledger-row">
+                <span>Lease start</span>
+                <strong>{selectedTenantFresh.lease_start || "Not set"}</strong>
+              </div>
+              <div className="ledger-row">
+                <span>Lease end</span>
+                <strong>{selectedTenantFresh.lease_end || "Not set"}</strong>
+              </div>
+              <div className="ledger-row">
+                <span>Last paid date</span>
+                <strong>{selectedTenantFresh.last_paid_date || "No payment yet"}</strong>
+              </div>
+              <div className="ledger-row">
+                <span>Last payment amount</span>
+                <strong>{formatCurrency(selectedTenantFresh.last_payment_amount)}</strong>
+              </div>
+            </div>
+
+            <div className="detail-actions">
+              <button
+                type="button"
+                className="ghost-button"
+                onClick={() => startEditingTenant(selectedTenantFresh)}
+                disabled={loading}
+              >
+                Edit Tenant
+              </button>
+              <button
+                type="button"
+                className="ghost-danger"
+                onClick={() => handleDeleteTenant(selectedTenantFresh)}
+                disabled={loading}
+              >
+                Delete Tenant
+              </button>
+            </div>
+          </section>
+        )}
+
       </main>
     </div>
   );

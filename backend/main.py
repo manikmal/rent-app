@@ -7,17 +7,13 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import pdfplumber
-import requests
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
 DB_PATH = DATA_DIR / "rent_management.db"
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://host.docker.internal:11434/api/generate")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3")
 
 
 app = FastAPI(title="Rent Management MVP")
@@ -197,99 +193,23 @@ def parse_payment_date(message: str) -> str:
 def parse_sender_details(message: str) -> Dict[str, Optional[str]]:
     match = re.search(r"NEFT-([A-Z0-9]+)-([A-Z][A-Z\s]*)", message.upper())
     if not match:
-        raise ValueError("Could not extract NEFT sender details from payment message.")
+        return {"sender_key": None, "sender_name": None}
     return {
         "sender_key": match.group(1).strip(),
         "sender_name": normalize_name(match.group(2)),
     }
 
 
-def build_lease_prompt(text: str) -> str:
-    return (
-        'Extract:\n\n'
-        '* rent due day\n'
-        '* lease start date\n'
-        '* lease end date\n\n'
-        'Return ONLY JSON:\n'
-        '{\n'
-        '"rent_due_day": int,\n'
-        '"lease_start": "YYYY-MM-DD",\n'
-        '"lease_end": "YYYY-MM-DD"\n'
-        '}\n\n'
-        f"Text: {text}"
-    )
-
-
-def extract_json_from_response(response_text: str) -> Dict[str, Any]:
-    try:
-        return json.loads(response_text)
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", response_text, re.DOTALL)
-        if not match:
-            raise ValueError("AI response did not contain valid JSON.")
-        try:
-            return json.loads(match.group(0))
-        except json.JSONDecodeError as exc:
-            raise ValueError("AI response contained malformed JSON.") from exc
-
-
-def call_ollama_for_lease(text: str) -> Dict[str, Any]:
-    try:
-        response = requests.post(
-            OLLAMA_URL,
-            json={
-                "model": OLLAMA_MODEL,
-                "prompt": build_lease_prompt(text),
-                "stream": False,
-            },
-            timeout=120,
-        )
-        response.raise_for_status()
-        payload = response.json()
-    except requests.RequestException as exc:
-        raise ValueError(f"Failed to reach Ollama: {exc}") from exc
-
-    raw_response = payload.get("response", "")
-    parsed = extract_json_from_response(raw_response)
-
-    try:
-        rent_due_day = int(parsed["rent_due_day"])
-        lease_start = datetime.strptime(parsed["lease_start"], "%Y-%m-%d").strftime("%Y-%m-%d")
-        lease_end = datetime.strptime(parsed["lease_end"], "%Y-%m-%d").strftime("%Y-%m-%d")
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError("AI response was missing required lease fields.") from exc
-
-    return {
-        "rent_due_day": rent_due_day,
-        "lease_start": lease_start,
-        "lease_end": lease_end,
-    }
-
-
-def extract_pdf_text(upload: UploadFile) -> str:
-    try:
-        with pdfplumber.open(upload.file) as pdf:
-            pages = [page.extract_text() or "" for page in pdf.pages]
-    except Exception as exc:
-        raise ValueError(f"Failed to parse PDF: {exc}") from exc
-    text = "\n".join(page for page in pages if page).strip()
-    if not text:
-        raise ValueError("No readable text found in PDF.")
-    return text
-
-
 def calculate_status(row: sqlite3.Row, today: Optional[date] = None) -> str:
     today = today or date.today()
-    last_paid_date = row["last_paid_date"]
-    paid_amount = paid_amount_for_row(row)
+    paid_amount = paid_amount_for_row(row, today)
     rent_amount = float(row["rent_amount"] or 0)
-    if last_paid_date:
-        paid_dt = datetime.strptime(last_paid_date, "%Y-%m-%d").date()
-        if paid_dt.year == today.year and paid_dt.month == today.month:
-            if paid_amount >= rent_amount > 0:
-                return "PAID"
-            if paid_amount > 0:
-                return "PARTIALLY_PAID"
+    if paid_amount > rent_amount > 0:
+        return "SURPLUS"
+    if paid_amount == rent_amount and rent_amount > 0:
+        return "PAID"
+    if paid_amount > 0:
+        return "PARTIALLY_PAID"
     rent_due_day = row["rent_due_day"]
     if rent_due_day is None:
         return "PENDING"
@@ -311,22 +231,34 @@ def row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
     return dict(row)
 
 
-def paid_amount_for_row(row: sqlite3.Row) -> float:
+def paid_amount_for_row(row: sqlite3.Row, reference_date: Optional[date] = None) -> float:
+    reference_date = reference_date or date.today()
+    if not row["last_paid_date"]:
+        return 0.0
+    last_paid_dt = datetime.strptime(row["last_paid_date"], "%Y-%m-%d").date()
+    if last_paid_dt.year != reference_date.year or last_paid_dt.month != reference_date.month:
+        return 0.0
     if row["current_month_paid_amount"] is not None:
         return float(row["current_month_paid_amount"])
     return float(row["last_payment_amount"] or 0)
 
 
-def balance_amount_for_row(row: sqlite3.Row) -> float:
-    return round(max(float(row["rent_amount"]) - paid_amount_for_row(row), 0), 2)
+def balance_amount_for_row(row: sqlite3.Row, reference_date: Optional[date] = None) -> float:
+    return round(max(float(row["rent_amount"]) - paid_amount_for_row(row, reference_date), 0), 2)
+
+
+def surplus_amount_for_row(row: sqlite3.Row, reference_date: Optional[date] = None) -> float:
+    return round(max(paid_amount_for_row(row, reference_date) - float(row["rent_amount"]), 0), 2)
 
 
 def enrich_property(row: sqlite3.Row) -> Dict[str, Any]:
+    paid_amount = round(paid_amount_for_row(row), 2)
     return {
         **row_to_dict(row),
         "status": calculate_status(row),
         "balance_amount": balance_amount_for_row(row),
-        "current_month_paid_amount": round(paid_amount_for_row(row), 2),
+        "surplus_amount": surplus_amount_for_row(row),
+        "current_month_paid_amount": paid_amount,
     }
 
 
@@ -342,6 +274,7 @@ def candidate_properties(extracted_name: str) -> List[Dict[str, Any]]:
             candidate = row_to_dict(prop)
             candidate["status"] = calculate_status(prop)
             candidate["balance_amount"] = balance_amount_for_row(prop)
+            candidate["surplus_amount"] = surplus_amount_for_row(prop)
             candidate["current_month_paid_amount"] = round(paid_amount_for_row(prop), 2)
             matches.append(candidate)
     return matches
@@ -354,6 +287,8 @@ def all_properties() -> List[Dict[str, Any]]:
 
 
 def find_property_by_sender_key(sender_key: str) -> Optional[Dict[str, Any]]:
+    if not sender_key:
+        return None
     with closing(get_connection()) as conn:
         row = conn.execute(
             """
@@ -370,20 +305,18 @@ def find_property_by_sender_key(sender_key: str) -> Optional[Dict[str, Any]]:
 
 
 def calculate_payment_totals(row: sqlite3.Row, payment_amount: float, payment_date: str) -> Dict[str, float]:
-    payment_dt = datetime.strptime(payment_date, "%Y-%m-%d")
-    existing_total = 0.0
-    if row["last_paid_date"]:
-        last_paid_dt = datetime.strptime(row["last_paid_date"], "%Y-%m-%d")
-        if last_paid_dt.year == payment_dt.year and last_paid_dt.month == payment_dt.month:
-            existing_total = paid_amount_for_row(row)
+    payment_dt = datetime.strptime(payment_date, "%Y-%m-%d").date()
+    existing_total = paid_amount_for_row(row, payment_dt)
 
     total_paid = round(existing_total + payment_amount, 2)
     rent_amount = round(float(row["rent_amount"]), 2)
     balance_amount = round(max(rent_amount - total_paid, 0), 2)
+    surplus_amount = round(max(total_paid - rent_amount, 0), 2)
     return {
         "total_paid": total_paid,
         "rent_amount": rent_amount,
         "balance_amount": balance_amount,
+        "surplus_amount": surplus_amount,
     }
 
 
@@ -394,7 +327,7 @@ def apply_payment_to_property(property_id: int, payment_amount: float, payment_d
             raise HTTPException(status_code=404, detail="Property not found.")
 
         totals = calculate_payment_totals(property_row, payment_amount, payment_date)
-        status = "PAID" if totals["balance_amount"] == 0 else "PARTIALLY_PAID"
+        status = "SURPLUS" if totals["surplus_amount"] > 0 else "PAID" if totals["balance_amount"] == 0 else "PARTIALLY_PAID"
 
         conn.execute(
             """
@@ -462,49 +395,7 @@ def health() -> Dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/upload-lease")
-async def upload_lease(
-    file: UploadFile = File(...),
-    tenant_name: str = Form(...),
-    rent_amount: float = Form(...),
-) -> Dict[str, Any]:
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
-
-    try:
-        extracted_text = extract_pdf_text(file)
-        lease_data = call_ollama_for_lease(extracted_text)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    with closing(get_connection()) as conn:
-        cursor = conn.execute(
-            """
-            INSERT INTO properties (
-                tenant_name, rent_amount, rent_due_day, lease_start, lease_end, status, last_paid_date, last_payment_amount, current_month_paid_amount
-            ) VALUES (?, ?, ?, ?, ?, 'PENDING', NULL, NULL, NULL)
-            """,
-            (
-                tenant_name.strip(),
-                rent_amount,
-                lease_data["rent_due_day"],
-                lease_data["lease_start"],
-                lease_data["lease_end"],
-            ),
-        )
-        property_id = int(cursor.lastrowid)
-        conn.commit()
-
-    return {
-        "property_id": property_id,
-        "tenant_name": tenant_name.strip(),
-        "rent_amount": rent_amount,
-        **lease_data,
-    }
-
-
-@app.post("/properties")
-def create_property(payload: PropertyCreateRequest) -> Dict[str, Any]:
+def validate_property_payload(payload: PropertyCreateRequest) -> Dict[str, Any]:
     tenant_name = payload.tenant_name.strip()
     if not tenant_name:
         raise HTTPException(status_code=400, detail="Tenant name is required.")
@@ -524,6 +415,19 @@ def create_property(payload: PropertyCreateRequest) -> Dict[str, Any]:
     if payload.rent_due_day is not None and not 1 <= payload.rent_due_day <= 31:
         raise HTTPException(status_code=400, detail="Rent due day must be between 1 and 31.")
 
+    return {
+        "tenant_name": tenant_name,
+        "rent_amount": round(float(payload.rent_amount), 2),
+        "rent_due_day": payload.rent_due_day,
+        "lease_start": lease_start,
+        "lease_end": lease_end,
+    }
+
+
+@app.post("/properties")
+def create_property(payload: PropertyCreateRequest) -> Dict[str, Any]:
+    data = validate_property_payload(payload)
+
     with closing(get_connection()) as conn:
         cursor = conn.execute(
             """
@@ -531,13 +435,60 @@ def create_property(payload: PropertyCreateRequest) -> Dict[str, Any]:
                 tenant_name, rent_amount, rent_due_day, lease_start, lease_end, status, last_paid_date, last_payment_amount, current_month_paid_amount
             ) VALUES (?, ?, ?, ?, ?, 'PENDING', NULL, NULL, NULL)
             """,
-            (tenant_name, payload.rent_amount, payload.rent_due_day, lease_start, lease_end),
+            (
+                data["tenant_name"],
+                data["rent_amount"],
+                data["rent_due_day"],
+                data["lease_start"],
+                data["lease_end"],
+            ),
         )
         property_id = int(cursor.lastrowid)
         conn.commit()
         row = conn.execute("SELECT * FROM properties WHERE id = ?", (property_id,)).fetchone()
 
     return enrich_property(row)
+
+
+@app.put("/properties/{property_id}")
+def update_property(property_id: int, payload: PropertyCreateRequest) -> Dict[str, Any]:
+    data = validate_property_payload(payload)
+    with closing(get_connection()) as conn:
+        existing_row = conn.execute("SELECT * FROM properties WHERE id = ?", (property_id,)).fetchone()
+        if not existing_row:
+            raise HTTPException(status_code=404, detail="Property not found.")
+
+        conn.execute(
+            """
+            UPDATE properties
+            SET tenant_name = ?, rent_amount = ?, rent_due_day = ?, lease_start = ?, lease_end = ?
+            WHERE id = ?
+            """,
+            (
+                data["tenant_name"],
+                data["rent_amount"],
+                data["rent_due_day"],
+                data["lease_start"],
+                data["lease_end"],
+                property_id,
+            ),
+        )
+        conn.commit()
+        updated_row = conn.execute("SELECT * FROM properties WHERE id = ?", (property_id,)).fetchone()
+    return enrich_property(updated_row)
+
+
+@app.delete("/properties/{property_id}")
+def delete_property(property_id: int) -> Dict[str, Any]:
+    with closing(get_connection()) as conn:
+        existing_row = conn.execute("SELECT id FROM properties WHERE id = ?", (property_id,)).fetchone()
+        if not existing_row:
+            raise HTTPException(status_code=404, detail="Property not found.")
+
+        conn.execute("DELETE FROM tenant_aliases WHERE property_id = ?", (property_id,))
+        conn.execute("DELETE FROM properties WHERE id = ?", (property_id,))
+        conn.commit()
+    return {"status": "deleted", "property_id": property_id}
 
 
 @app.get("/properties")
@@ -580,6 +531,7 @@ def process_payment(payload: PaymentRequest) -> Dict[str, Any]:
             "extracted_tenant_name": sender_details["sender_name"],
             "balance_amount": matched_by_alias["balance_amount"],
             "current_month_paid_amount": matched_by_alias["current_month_paid_amount"],
+            "surplus_amount": matched_by_alias["surplus_amount"],
         }
 
     candidates = candidate_properties(sender_details["sender_name"] or "")
@@ -601,6 +553,7 @@ def process_payment(payload: PaymentRequest) -> Dict[str, Any]:
         "sender_key": sender_details["sender_key"],
         "amount": amount,
         "date": payment_date,
+        "matching_hint": "saved sender not found" if sender_details["sender_key"] else "sender could not be identified",
     }
 
 
@@ -612,18 +565,12 @@ def manual_match(payload: ManualMatchRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail="Date must be YYYY-MM-DD.") from exc
 
     with closing(get_connection()) as conn:
-        property_row = conn.execute(
-            "SELECT * FROM properties WHERE id = ?", (payload.property_id,)
-        ).fetchone()
+        property_row = conn.execute("SELECT * FROM properties WHERE id = ?", (payload.property_id,)).fetchone()
         if not property_row:
             raise HTTPException(status_code=404, detail="Property not found.")
 
-        payment_row = conn.execute("SELECT * FROM properties WHERE id = ?", (payload.property_id,)).fetchone()
-        if not payment_row:
-            raise HTTPException(status_code=404, detail="Property not found.")
-
-        totals = calculate_payment_totals(payment_row, payload.amount, normalized_date)
-        status = "PAID" if totals["balance_amount"] == 0 else "PARTIALLY_PAID"
+        totals = calculate_payment_totals(property_row, payload.amount, normalized_date)
+        status = "SURPLUS" if totals["surplus_amount"] > 0 else "PAID" if totals["balance_amount"] == 0 else "PARTIALLY_PAID"
         conn.execute(
             """
             UPDATE properties
@@ -665,4 +612,5 @@ def manual_match(payload: ManualMatchRequest) -> Dict[str, Any]:
         "sender_key": payload.sender_key,
         "balance_amount": enriched["balance_amount"],
         "current_month_paid_amount": enriched["current_month_paid_amount"],
+        "surplus_amount": enriched["surplus_amount"],
     }
