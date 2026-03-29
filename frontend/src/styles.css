@@ -345,13 +345,15 @@ textarea {
 }
 
 .attention-list,
+.standout-list,
 .inbox-list,
 .tenant-grid {
   display: grid;
   gap: 14px;
 }
 
-.attention-item {
+.attention-item,
+.standout-item {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -367,9 +369,14 @@ textarea {
 }
 
 .attention-item strong,
+.standout-item strong,
 .inbox-head strong {
   display: block;
   margin-bottom: 4px;
+}
+
+.standout-item {
+  background: linear-gradient(180deg, rgba(251, 235, 231, 0.95), rgba(246, 223, 218, 0.92));
 }
 
 .inbox-item {
@@ -433,6 +440,16 @@ textarea {
   font-size: 1.45rem;
 }
 
+.tenant-property {
+  margin: -2px 0 10px;
+  color: var(--muted);
+  font-size: 0.98rem;
+}
+
+.tenant-property-detail {
+  margin-top: 8px;
+}
+
 .tenant-finance {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -456,6 +473,41 @@ textarea {
 .editor-form {
   display: grid;
   gap: 14px;
+}
+
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.rent-increase-panel,
+.rent-history-card {
+  padding: 18px;
+  border-radius: 22px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.66);
+}
+
+.rent-increase-list,
+.rent-history-list {
+  display: grid;
+  gap: 12px;
+}
+
+.rent-increase-card {
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+  border-radius: 20px;
+  border: 1px solid var(--line);
+  background: rgba(255, 249, 242, 0.82);
+}
+
+.rent-increase-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
 }
 
 .detail-hero {
@@ -545,6 +597,8 @@ textarea {
   }
 
   .matcher-inline,
+  .form-grid,
+  .rent-increase-grid,
   .tenant-finance,
   .tenant-meta,
   .detail-grid {

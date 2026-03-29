@@ -1,25 +1,42 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import "./styles.css";
 
 const API_BASE = process.env.REACT_APP_API_BASE || "http://localhost:8000";
 
+const createRentIncreaseForm = () => ({
+  id: null,
+  dateFrom: "",
+  dateTill: "",
+  rentAmount: "",
+});
+
 const emptyTenantForm = {
   id: null,
   tenantName: "",
+  propertyName: "",
   rentAmount: "",
   rentDueDay: "",
   leaseStart: "",
   leaseEnd: "",
+  rentIncreases: [],
 };
 
 function toTenantForm(property) {
   return {
     id: property?.id ?? null,
     tenantName: property?.tenant_name ?? "",
+    propertyName: property?.property_name ?? "",
     rentAmount: property?.rent_amount ?? "",
     rentDueDay: property?.rent_due_day ?? "",
     leaseStart: property?.lease_start ?? "",
     leaseEnd: property?.lease_end ?? "",
+    rentIncreases:
+      property?.rent_increases?.map((item) => ({
+        id: item.id ?? null,
+        dateFrom: item.date_from ?? "",
+        dateTill: item.date_till ?? "",
+        rentAmount: item.rent_amount ?? "",
+      })) ?? [],
   };
 }
 
@@ -31,7 +48,7 @@ function formatCurrency(value) {
 }
 
 function metricRows(properties, unmatchedPayments) {
-  const totalExpected = properties.reduce((sum, item) => sum + Number(item.rent_amount || 0), 0);
+  const totalExpected = properties.reduce((sum, item) => sum + Number(item.current_rent_amount || 0), 0);
   const totalCollected = properties.reduce(
     (sum, item) => sum + Number(item.current_month_paid_amount || 0),
     0
@@ -70,6 +87,7 @@ function App() {
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [loading, setLoading] = useState(false);
+  const editorRef = useRef(null);
 
   const loadData = async () => {
     try {
@@ -95,6 +113,12 @@ function App() {
     loadData();
   }, []);
 
+  useEffect(() => {
+    if (showTenantForm && editorRef.current) {
+      editorRef.current.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+  }, [showTenantForm, tenantForm.id]);
+
   const metrics = useMemo(
     () => metricRows(properties, unmatchedPayments),
     [properties, unmatchedPayments]
@@ -105,6 +129,19 @@ function App() {
       properties.filter((item) => ["LATE", "PARTIALLY_PAID", "SURPLUS"].includes(item.status)),
     [properties]
   );
+
+  const unpaidItems = useMemo(
+    () =>
+      properties.filter(
+        (item) =>
+          Number(item.balance_amount || 0) > 0 &&
+          ["LATE", "PARTIALLY_PAID"].includes(item.status)
+      ),
+    [properties]
+  );
+
+  const selectedTenantFresh =
+    selectedTenant && properties.find((property) => property.id === selectedTenant.id);
 
   const resetTenantEditor = () => {
     setTenantForm(emptyTenantForm);
@@ -129,6 +166,29 @@ function App() {
     setShowTenantForm(true);
   };
 
+  const updateRentIncreaseField = (index, field, value) => {
+    setTenantForm((current) => ({
+      ...current,
+      rentIncreases: current.rentIncreases.map((item, itemIndex) =>
+        itemIndex === index ? { ...item, [field]: value } : item
+      ),
+    }));
+  };
+
+  const addRentIncrease = () => {
+    setTenantForm((current) => ({
+      ...current,
+      rentIncreases: [...current.rentIncreases, createRentIncreaseForm()],
+    }));
+  };
+
+  const removeRentIncrease = (index) => {
+    setTenantForm((current) => ({
+      ...current,
+      rentIncreases: current.rentIncreases.filter((_, itemIndex) => itemIndex !== index),
+    }));
+  };
+
   const handleTenantSave = async (event) => {
     event.preventDefault();
     setLoading(true);
@@ -138,10 +198,16 @@ function App() {
     try {
       const payload = {
         tenant_name: tenantForm.tenantName,
+        property_name: tenantForm.propertyName,
         rent_amount: Number(tenantForm.rentAmount),
         rent_due_day: tenantForm.rentDueDay ? Number(tenantForm.rentDueDay) : null,
         lease_start: tenantForm.leaseStart || null,
         lease_end: tenantForm.leaseEnd || null,
+        rent_increases: tenantForm.rentIncreases.map((item) => ({
+          date_from: item.dateFrom,
+          date_till: item.dateTill,
+          rent_amount: Number(item.rentAmount),
+        })),
       };
 
       const isEditing = Boolean(tenantForm.id);
@@ -228,7 +294,14 @@ function App() {
     }
   };
 
-  const savePaymentMatch = async ({ selectionKey, propertyId, amount, date, unmatchedPaymentId, senderKey }) => {
+  const savePaymentMatch = async ({
+    selectionKey,
+    propertyId,
+    amount,
+    date,
+    unmatchedPaymentId,
+    senderKey,
+  }) => {
     if (!propertyId) {
       setError("Please select a tenant to match this payment.");
       return;
@@ -283,7 +356,8 @@ function App() {
         <option value="">Choose tenant</option>
         {(payment.candidates?.length > 0 ? payment.candidates : properties).map((property) => (
           <option key={property.id} value={property.id}>
-            {property.tenant_name} • {formatCurrency(property.rent_amount)}
+            {property.tenant_name} • {property.property_name || "Property not set"} •{" "}
+            {formatCurrency(property.current_rent_amount || property.rent_amount)}
           </option>
         ))}
       </select>
@@ -306,9 +380,6 @@ function App() {
     </div>
   );
 
-  const selectedTenantFresh =
-    selectedTenant && properties.find((property) => property.id === selectedTenant.id);
-
   return (
     <div className="app-shell">
       <header className="hero">
@@ -329,100 +400,6 @@ function App() {
 
       {error && <div className="banner error">{error}</div>}
       {notice && <div className="banner success">{notice}</div>}
-
-      {showTenantForm && (
-        <section className="surface editor-surface editor-surface-inline">
-          <div className="section-head">
-            <div>
-              <p className="section-kicker">Editor</p>
-              <h2>{tenantForm.id ? "Edit tenant" : "Add tenant"}</h2>
-            </div>
-            <button type="button" className="ghost-button" onClick={resetTenantEditor} disabled={loading}>
-              Close
-            </button>
-          </div>
-
-          <form onSubmit={handleTenantSave} className="editor-form">
-            <label className="field">
-              Tenant name
-              <input
-                value={tenantForm.tenantName}
-                onChange={(e) =>
-                  setTenantForm((current) => ({
-                    ...current,
-                    tenantName: e.target.value,
-                  }))
-                }
-                required
-              />
-            </label>
-
-            <label className="field">
-              Rent amount
-              <input
-                type="number"
-                step="0.01"
-                value={tenantForm.rentAmount}
-                onChange={(e) =>
-                  setTenantForm((current) => ({
-                    ...current,
-                    rentAmount: e.target.value,
-                  }))
-                }
-                required
-              />
-            </label>
-
-            <label className="field">
-              Due day
-              <input
-                type="number"
-                min="1"
-                max="31"
-                value={tenantForm.rentDueDay}
-                onChange={(e) =>
-                  setTenantForm((current) => ({
-                    ...current,
-                    rentDueDay: e.target.value,
-                  }))
-                }
-              />
-            </label>
-
-            <label className="field">
-              Lease start
-              <input
-                type="date"
-                value={tenantForm.leaseStart}
-                onChange={(e) =>
-                  setTenantForm((current) => ({
-                    ...current,
-                    leaseStart: e.target.value,
-                  }))
-                }
-              />
-            </label>
-
-            <label className="field">
-              Lease end
-              <input
-                type="date"
-                value={tenantForm.leaseEnd}
-                onChange={(e) =>
-                  setTenantForm((current) => ({
-                    ...current,
-                    leaseEnd: e.target.value,
-                  }))
-                }
-              />
-            </label>
-
-            <button type="submit" className="primary-wide" disabled={loading}>
-              {loading ? "Saving..." : tenantForm.id ? "Save changes" : "Create tenant"}
-            </button>
-          </form>
-        </section>
-      )}
 
       <section className="metrics-grid">
         {metrics.map((metric) => (
@@ -473,6 +450,7 @@ function App() {
               {paymentResult.matched_property ? (
                 <div className="payment-summary">
                   <p>{paymentResult.matched_property.tenant_name}</p>
+                  <span>{paymentResult.matched_property.property_name || "Property not set"}</span>
                   <span>Paid this month: {formatCurrency(paymentResult.current_month_paid_amount)}</span>
                   <span>Balance: {formatCurrency(paymentResult.balance_amount)}</span>
                   <span>Surplus: {formatCurrency(paymentResult.surplus_amount)}</span>
@@ -499,6 +477,34 @@ function App() {
         <section className="surface sidebar-panel">
           <div className="section-head">
             <div>
+              <p className="section-kicker">Rent Due</p>
+              <h2>Still unpaid this month</h2>
+            </div>
+          </div>
+
+          {unpaidItems.length === 0 ? (
+            <div className="empty-note">No unpaid tenant balances right now.</div>
+          ) : (
+            <div className="standout-list">
+              {unpaidItems.map((item) => (
+                <button
+                  key={item.id}
+                  type="button"
+                  className="standout-item"
+                  onClick={() => openTenantDetails(item)}
+                >
+                  <div>
+                    <strong>{item.tenant_name}</strong>
+                    <span>{item.property_name || "Property not set"}</span>
+                  </div>
+                  <small>{formatCurrency(item.balance_amount)}</small>
+                </button>
+              ))}
+            </div>
+          )}
+
+          <div className="section-head compact">
+            <div>
               <p className="section-kicker">Attention</p>
               <h2>What needs action</h2>
             </div>
@@ -517,7 +523,9 @@ function App() {
                 >
                   <div>
                     <strong>{item.tenant_name}</strong>
-                    <span>{item.status.replaceAll("_", " ")}</span>
+                    <span>
+                      {item.property_name || "Property not set"} • {item.status.replaceAll("_", " ")}
+                    </span>
                   </div>
                   <small>{formatCurrency(item.balance_amount || item.surplus_amount || 0)}</small>
                 </button>
@@ -559,6 +567,180 @@ function App() {
             </div>
           </div>
 
+          {showTenantForm && (
+            <section ref={editorRef} className="surface editor-surface editor-surface-inline">
+              <div className="section-head">
+                <div>
+                  <p className="section-kicker">Editor</p>
+                  <h2>{tenantForm.id ? "Edit tenant" : "Add tenant"}</h2>
+                </div>
+                <button type="button" className="ghost-button" onClick={resetTenantEditor} disabled={loading}>
+                  Close
+                </button>
+              </div>
+
+              <form onSubmit={handleTenantSave} className="editor-form">
+                <div className="form-grid">
+                  <label className="field">
+                    Tenant name
+                    <input
+                      value={tenantForm.tenantName}
+                      onChange={(e) =>
+                        setTenantForm((current) => ({
+                          ...current,
+                          tenantName: e.target.value,
+                        }))
+                      }
+                      required
+                    />
+                  </label>
+
+                  <label className="field">
+                    Property name
+                    <input
+                      value={tenantForm.propertyName}
+                      onChange={(e) =>
+                        setTenantForm((current) => ({
+                          ...current,
+                          propertyName: e.target.value,
+                        }))
+                      }
+                      required
+                    />
+                  </label>
+
+                  <label className="field">
+                    Current rent amount
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={tenantForm.rentAmount}
+                      onChange={(e) =>
+                        setTenantForm((current) => ({
+                          ...current,
+                          rentAmount: e.target.value,
+                        }))
+                      }
+                      required
+                    />
+                  </label>
+
+                  <label className="field">
+                    Due day
+                    <input
+                      type="number"
+                      min="1"
+                      max="31"
+                      value={tenantForm.rentDueDay}
+                      onChange={(e) =>
+                        setTenantForm((current) => ({
+                          ...current,
+                          rentDueDay: e.target.value,
+                        }))
+                      }
+                    />
+                  </label>
+
+                  <label className="field">
+                    Lease start
+                    <input
+                      type="date"
+                      value={tenantForm.leaseStart}
+                      onChange={(e) =>
+                        setTenantForm((current) => ({
+                          ...current,
+                          leaseStart: e.target.value,
+                        }))
+                      }
+                    />
+                  </label>
+
+                  <label className="field">
+                    Lease end
+                    <input
+                      type="date"
+                      value={tenantForm.leaseEnd}
+                      onChange={(e) =>
+                        setTenantForm((current) => ({
+                          ...current,
+                          leaseEnd: e.target.value,
+                        }))
+                      }
+                    />
+                  </label>
+                </div>
+
+                <div className="rent-increase-panel">
+                  <div className="section-head compact">
+                    <div>
+                      <p className="section-kicker">Lease Changes</p>
+                      <h2>Rent increases</h2>
+                    </div>
+                    <button type="button" className="ghost-button" onClick={addRentIncrease} disabled={loading}>
+                      Add Rent Increase
+                    </button>
+                  </div>
+
+                  {tenantForm.rentIncreases.length === 0 ? (
+                    <div className="empty-note">No rent increases added yet.</div>
+                  ) : (
+                    <div className="rent-increase-list">
+                      {tenantForm.rentIncreases.map((item, index) => (
+                        <div key={`${item.id || "new"}-${index}`} className="rent-increase-card">
+                          <div className="rent-increase-grid">
+                            <label className="field">
+                              Date from
+                              <input
+                                type="date"
+                                value={item.dateFrom}
+                                onChange={(e) => updateRentIncreaseField(index, "dateFrom", e.target.value)}
+                                required
+                              />
+                            </label>
+
+                            <label className="field">
+                              Date till
+                              <input
+                                type="date"
+                                value={item.dateTill}
+                                onChange={(e) => updateRentIncreaseField(index, "dateTill", e.target.value)}
+                                required
+                              />
+                            </label>
+
+                            <label className="field">
+                              New rent amount
+                              <input
+                                type="number"
+                                step="0.01"
+                                value={item.rentAmount}
+                                onChange={(e) => updateRentIncreaseField(index, "rentAmount", e.target.value)}
+                                required
+                              />
+                            </label>
+                          </div>
+
+                          <button
+                            type="button"
+                            className="ghost-danger"
+                            onClick={() => removeRentIncrease(index)}
+                            disabled={loading}
+                          >
+                            Remove
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                <button type="submit" className="primary-wide" disabled={loading}>
+                  {loading ? "Saving..." : tenantForm.id ? "Save changes" : "Create tenant"}
+                </button>
+              </form>
+            </section>
+          )}
+
           {properties.length === 0 ? (
             <div className="empty-note">No tenants yet. Start by adding one.</div>
           ) : (
@@ -572,6 +754,7 @@ function App() {
                   <div className="tenant-card-head">
                     <div>
                       <h3>{property.tenant_name}</h3>
+                      <p className="tenant-property">{property.property_name || "Property not set"}</p>
                       <span className={`status-pill status-${property.status.toLowerCase()}`}>
                         {property.status.replaceAll("_", " ")}
                       </span>
@@ -604,8 +787,8 @@ function App() {
 
                   <div className="tenant-finance">
                     <div>
-                      <p>Monthly rent</p>
-                      <strong>{formatCurrency(property.rent_amount)}</strong>
+                      <p>Current rent amount</p>
+                      <strong>{formatCurrency(property.current_rent_amount || property.rent_amount)}</strong>
                     </div>
                     <div>
                       <p>Collected</p>
@@ -622,6 +805,7 @@ function App() {
                   </div>
 
                   <div className="tenant-meta">
+                    <span>Property: {property.property_name || "Not set"}</span>
                     <span>Due day: {property.rent_due_day || "Not set"}</span>
                     <span>Lease start: {property.lease_start || "Not set"}</span>
                     <span>Lease end: {property.lease_end || "Not set"}</span>
@@ -639,6 +823,9 @@ function App() {
               <div>
                 <p className="section-kicker">Tenant Detail</p>
                 <h2>{selectedTenantFresh.tenant_name}</h2>
+                <p className="tenant-property tenant-property-detail">
+                  {selectedTenantFresh.property_name || "Property not set"}
+                </p>
               </div>
               <button
                 type="button"
@@ -654,8 +841,10 @@ function App() {
               <span className={`status-pill status-${selectedTenantFresh.status.toLowerCase()}`}>
                 {selectedTenantFresh.status.replaceAll("_", " ")}
               </span>
-              <strong>{formatCurrency(selectedTenantFresh.rent_amount)}</strong>
-              <p>Monthly rent</p>
+              <strong>
+                {formatCurrency(selectedTenantFresh.current_rent_amount || selectedTenantFresh.rent_amount)}
+              </strong>
+              <p>Current rent amount</p>
             </div>
 
             <div className="detail-grid">
@@ -679,6 +868,10 @@ function App() {
 
             <div className="ledger-card">
               <div className="ledger-row">
+                <span>Property</span>
+                <strong>{selectedTenantFresh.property_name || "Not set"}</strong>
+              </div>
+              <div className="ledger-row">
                 <span>Lease start</span>
                 <strong>{selectedTenantFresh.lease_start || "Not set"}</strong>
               </div>
@@ -694,6 +887,30 @@ function App() {
                 <span>Last payment amount</span>
                 <strong>{formatCurrency(selectedTenantFresh.last_payment_amount)}</strong>
               </div>
+            </div>
+
+            <div className="rent-history-card">
+              <div className="section-head compact">
+                <div>
+                  <p className="section-kicker">Lease Changes</p>
+                  <h2>Rent increase history</h2>
+                </div>
+              </div>
+
+              {selectedTenantFresh.rent_increases?.length ? (
+                <div className="rent-history-list">
+                  {selectedTenantFresh.rent_increases.map((item) => (
+                    <div key={item.id || `${item.date_from}-${item.date_till}`} className="ledger-row">
+                      <span>
+                        {item.date_from} to {item.date_till}
+                      </span>
+                      <strong>{formatCurrency(item.rent_amount)}</strong>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="empty-note">No rent increases recorded for this tenant.</div>
+              )}
             </div>
 
             <div className="detail-actions">
@@ -716,7 +933,6 @@ function App() {
             </div>
           </section>
         )}
-
       </main>
     </div>
   );
