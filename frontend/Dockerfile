@@ -1,4 +1,4 @@
-FROM node:20-alpine
+FROM node:20-alpine AS build
 
 WORKDIR /app
 
@@ -8,10 +8,16 @@ RUN npm install
 COPY public ./public
 COPY src ./src
 
-ENV HOST=0.0.0.0
-ENV PORT=3000
-ENV REACT_APP_API_BASE=http://localhost:8000
+ARG REACT_APP_API_BASE=/api
+ENV REACT_APP_API_BASE=${REACT_APP_API_BASE}
 
-EXPOSE 3000
+RUN npm run build
 
-CMD ["npm", "start"]
+FROM nginx:1.27-alpine
+
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+COPY --from=build /app/build /usr/share/nginx/html
+
+EXPOSE 80
+
+CMD ["nginx", "-g", "daemon off;"]

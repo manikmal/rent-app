@@ -61,6 +61,15 @@ button:disabled {
   box-shadow: none;
 }
 
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible,
+.tenant-card-main:focus-visible {
+  outline: 3px solid rgba(31, 111, 120, 0.26);
+  outline-offset: 2px;
+}
+
 input,
 textarea,
 select {
@@ -81,6 +90,16 @@ textarea {
   padding: 28px;
 }
 
+.auth-shell {
+  display: grid;
+  place-items: center;
+}
+
+.auth-card {
+  width: min(520px, 100%);
+  padding: 28px;
+}
+
 .hero {
   display: flex;
   align-items: flex-end;
@@ -96,14 +115,33 @@ textarea {
   box-shadow: var(--shadow);
 }
 
+.hero-actions {
+  display: grid;
+  gap: 12px;
+  width: min(280px, 100%);
+}
+
+.hero-user {
+  display: grid;
+  gap: 8px;
+  color: var(--muted);
+}
+
+.month-field {
+  min-width: 200px;
+}
+
 .eyebrow,
 .section-kicker,
 .metric-card p,
+.metric-card span,
 .tenant-finance p,
 .tenant-meta span,
 .payment-summary span,
 .inbox-item p,
-.attention-item span {
+.trend-card p,
+.history-row p,
+.reminder-card p {
   margin: 0;
   letter-spacing: 0.08em;
   text-transform: uppercase;
@@ -132,10 +170,6 @@ textarea {
   font-size: 1.02rem;
 }
 
-.hero-cta {
-  flex-shrink: 0;
-}
-
 .banner {
   margin-bottom: 16px;
   padding: 14px 16px;
@@ -161,7 +195,7 @@ textarea {
 }
 
 .metric-card {
-  min-height: 120px;
+  min-height: 124px;
   padding: 18px;
   border: 1px solid var(--line);
   border-radius: 24px;
@@ -171,8 +205,8 @@ textarea {
 
 .metric-card strong {
   display: block;
-  margin-top: 18px;
-  font-size: 1.55rem;
+  margin: 16px 0 10px;
+  font-size: 1.5rem;
   line-height: 1.05;
 }
 
@@ -200,9 +234,16 @@ textarea {
   background: linear-gradient(180deg, rgba(237, 241, 245, 0.95), rgba(226, 232, 238, 0.9));
 }
 
+.insight-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 20px;
+  margin-bottom: 20px;
+}
+
 .dashboard-grid {
   display: grid;
-  grid-template-columns: 1.2fr 0.85fr;
+  grid-template-columns: minmax(0, 1.08fr) minmax(340px, 0.92fr);
   gap: 20px;
   align-items: start;
 }
@@ -216,24 +257,21 @@ textarea {
 
 .command-center,
 .sidebar-panel,
+.review-panel,
+.insight-panel,
 .editor-surface {
   padding: 24px;
 }
 
-.roster-surface {
+.roster-surface,
+.detail-surface {
   grid-column: 1 / -1;
   padding: 24px;
 }
 
 .detail-surface {
-  grid-column: 1 / -1;
-  padding: 24px;
   background:
     linear-gradient(180deg, rgba(255, 251, 245, 0.96), rgba(244, 238, 228, 0.92));
-}
-
-.editor-surface-inline {
-  grid-column: 1 / -1;
 }
 
 .section-head {
@@ -273,7 +311,9 @@ textarea {
 }
 
 .payment-card,
-.empty-note {
+.empty-note,
+.reminder-card,
+.trend-card {
   margin-top: 16px;
   padding: 18px;
   border-radius: 22px;
@@ -281,7 +321,11 @@ textarea {
   border: 1px solid var(--line);
 }
 
-.payment-topline {
+.payment-topline,
+.inbox-head,
+.trend-head,
+.history-row,
+.ledger-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -300,16 +344,28 @@ textarea {
   font-weight: 700;
 }
 
-.matcher-inline {
+.review-actions {
+  display: grid;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.matcher-inline,
+.inline-actions {
   display: grid;
   grid-template-columns: 1fr auto;
   gap: 10px;
-  margin-top: 16px;
+}
+
+.inline-actions {
+  grid-template-columns: repeat(2, auto);
+  justify-content: end;
 }
 
 .status-pill {
   display: inline-flex;
   align-items: center;
+  width: fit-content;
   padding: 7px 12px;
   border-radius: 999px;
   font-size: 12px;
@@ -318,7 +374,8 @@ textarea {
   letter-spacing: 0.06em;
 }
 
-.status-paid {
+.status-paid,
+.status-posted {
   background: var(--mint-soft);
   color: var(--mint);
 }
@@ -339,59 +396,64 @@ textarea {
 }
 
 .status-late,
-.status-unmatched {
+.status-unmatched,
+.status-reversed,
+.status-rejected,
+.status-duplicate {
   background: var(--coral-soft);
   color: var(--coral);
 }
 
-.attention-list,
-.standout-list,
+.reminder-list,
+.trend-list,
 .inbox-list,
-.tenant-grid {
+.tenant-grid,
+.history-list {
   display: grid;
   gap: 14px;
 }
 
-.attention-item,
-.standout-item {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 14px;
-  width: 100%;
-  padding: 16px;
-  border-radius: 20px;
-  border: 1px solid var(--line);
-  background: var(--paper-strong);
-  color: var(--ink);
-  text-align: left;
-  box-shadow: none;
-}
-
-.attention-item strong,
-.standout-item strong,
-.inbox-head strong {
+.reminder-card strong,
+.trend-card strong,
+.inbox-head strong,
+.history-row strong {
   display: block;
   margin-bottom: 4px;
 }
 
-.standout-item {
-  background: linear-gradient(180deg, rgba(251, 235, 231, 0.95), rgba(246, 223, 218, 0.92));
+.severity-high {
+  background: rgba(251, 235, 231, 0.95);
 }
 
-.inbox-item {
-  padding: 16px;
-  border-radius: 20px;
-  border: 1px solid var(--line);
-  background: rgba(255, 255, 255, 0.66);
+.severity-medium {
+  background: rgba(251, 241, 224, 0.95);
 }
 
-.inbox-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 10px;
+.severity-info {
+  background: rgba(231, 242, 244, 0.95);
+}
+
+.trend-bar {
+  position: relative;
+  height: 10px;
+  overflow: hidden;
+  margin: 14px 0;
+  border-radius: 999px;
+  background: rgba(45, 63, 89, 0.12);
+}
+
+.trend-bar span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--teal), var(--mint));
+}
+
+.filter-grid {
+  display: grid;
+  grid-template-columns: 1.5fr repeat(2, minmax(0, 220px));
+  gap: 14px;
+  margin-bottom: 20px;
 }
 
 .tenant-grid {
@@ -399,18 +461,13 @@ textarea {
 }
 
 .tenant-card {
-  padding: 20px;
+  display: grid;
+  gap: 14px;
+  padding: 18px;
   border-radius: 26px;
   border: 1px solid var(--line);
   background:
     linear-gradient(180deg, rgba(255, 252, 247, 0.95), rgba(249, 243, 233, 0.92));
-  cursor: pointer;
-  transition: transform 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
-}
-
-.tenant-card:hover {
-  transform: translateY(-2px);
-  box-shadow: 0 16px 32px rgba(91, 71, 42, 0.12);
 }
 
 .tenant-card.selected {
@@ -418,9 +475,29 @@ textarea {
   box-shadow: 0 18px 34px rgba(31, 111, 120, 0.14);
 }
 
+.tenant-card-main {
+  display: grid;
+  gap: 18px;
+  width: 100%;
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: inherit;
+  box-shadow: none;
+  text-align: left;
+}
+
+.tenant-card-main:hover {
+  transform: none;
+  box-shadow: none;
+}
+
 .tenant-card-head,
 .tenant-actions,
-.tenant-finance {
+.tenant-finance,
+.detail-actions,
+.detail-columns {
   display: flex;
   gap: 12px;
 }
@@ -430,9 +507,24 @@ textarea {
   justify-content: space-between;
 }
 
+.tenant-card-aside {
+  display: grid;
+  justify-items: end;
+  gap: 6px;
+}
+
+.tenant-card-aside strong {
+  font-size: 1.1rem;
+}
+
+.tenant-card-aside span {
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
 .tenant-actions {
-  flex-wrap: wrap;
   justify-content: flex-end;
+  flex-wrap: wrap;
 }
 
 .tenant-card h3 {
@@ -454,7 +546,6 @@ textarea {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 12px;
-  margin-top: 18px;
 }
 
 .tenant-finance strong {
@@ -467,32 +558,31 @@ textarea {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
-  margin-top: 18px;
 }
 
-.editor-form {
+.editor-form,
+.form-grid,
+.rent-increase-list,
+.rent-history-list {
   display: grid;
   gap: 14px;
 }
 
 .form-grid {
-  display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 14px;
+}
+
+.field-span-2 {
+  grid-column: span 2;
 }
 
 .rent-increase-panel,
-.rent-history-card {
+.rent-history-card,
+.ledger-card {
   padding: 18px;
   border-radius: 22px;
   border: 1px solid var(--line);
   background: rgba(255, 255, 255, 0.66);
-}
-
-.rent-increase-list,
-.rent-history-list {
-  display: grid;
-  gap: 12px;
 }
 
 .rent-increase-card {
@@ -523,7 +613,8 @@ textarea {
 
 .detail-hero p,
 .detail-card p,
-.ledger-row span {
+.ledger-row span,
+.ledger-stack span {
   margin: 0;
   color: var(--muted);
 }
@@ -535,12 +626,24 @@ textarea {
   margin-bottom: 18px;
 }
 
-.detail-card,
-.ledger-card {
+.detail-columns {
+  align-items: start;
+  margin-top: 18px;
+}
+
+.detail-columns > * {
+  flex: 1 1 0;
+}
+
+.detail-card {
   padding: 16px;
   border-radius: 22px;
   border: 1px solid var(--line);
   background: rgba(255, 255, 255, 0.66);
+}
+
+.compact-detail-card {
+  padding: 14px 16px;
 }
 
 .detail-card strong {
@@ -554,16 +657,44 @@ textarea {
   gap: 12px;
 }
 
-.ledger-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
+.ledger-stack {
+  display: grid;
+  gap: 8px;
+}
+
+.history-row {
+  padding: 14px 0;
+  border-top: 1px solid var(--line);
+}
+
+.history-filter-bar,
+.history-summary-grid {
+  display: grid;
+  gap: 14px;
+}
+
+.history-filter-bar {
+  grid-template-columns: repeat(2, minmax(0, 1fr)) auto;
+  margin-bottom: 18px;
+  align-items: end;
+}
+
+.history-summary-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin-bottom: 12px;
+}
+
+.history-row:first-child {
+  padding-top: 0;
+  border-top: none;
+}
+
+.history-row-stacked {
+  align-items: flex-start;
 }
 
 .detail-actions {
-  display: flex;
-  gap: 12px;
+  flex-wrap: wrap;
   margin-top: 18px;
 }
 
@@ -572,8 +703,11 @@ textarea {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
-  .tenant-grid {
+  .insight-grid,
+  .tenant-grid,
+  .detail-columns {
     grid-template-columns: 1fr;
+    display: grid;
   }
 }
 
@@ -583,9 +717,10 @@ textarea {
   }
 
   .hero,
+  .insight-grid,
   .dashboard-grid {
-    grid-template-columns: 1fr;
     display: grid;
+    grid-template-columns: 1fr;
   }
 
   .hero {
@@ -596,21 +731,36 @@ textarea {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
+  .filter-grid,
   .matcher-inline,
+  .inline-actions,
   .form-grid,
   .rent-increase-grid,
+  .history-filter-bar,
+  .history-summary-grid,
   .tenant-finance,
   .tenant-meta,
   .detail-grid {
     grid-template-columns: 1fr;
   }
 
+  .field-span-2 {
+    grid-column: span 1;
+  }
+
   .tenant-card-head,
+  .tenant-actions,
   .section-head,
   .payment-topline,
+  .trend-head,
+  .history-row,
   .ledger-row,
   .detail-actions {
     flex-direction: column;
     align-items: flex-start;
+  }
+
+  .tenant-card-aside {
+    justify-items: start;
   }
 }

@@ -1,25 +1,63 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: rent-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-rent_app}
+      POSTGRES_USER: ${POSTGRES_USER:-rent_app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rent_app}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rent_app} -d ${POSTGRES_DB:-rent_app}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
   backend:
     build: ./backend
     container_name: rent-backend
-    ports:
-      - "8000:8000"
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
     environment:
-      DATA_DIR: /data
-      OLLAMA_URL: http://host.docker.internal:11434
-      OLLAMA_MODEL: llama3
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    volumes:
-      - rent_data:/data
+      DATABASE_URL: ${DATABASE_URL:-postgresql://rent_app:rent_app@postgres:5432/rent_app}
+      ALLOW_ORIGINS: ${ALLOW_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
+      APP_USERS: ${APP_USERS:-admin:changeme}
+      APP_SESSION_SECRET: ${APP_SESSION_SECRET:-change-this-session-secret}
+      SESSION_MAX_AGE_HOURS: ${SESSION_MAX_AGE_HOURS:-12}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
 
   frontend:
-    build: ./frontend
+    build:
+      context: ./frontend
+      args:
+        REACT_APP_API_BASE: /api
     container_name: rent-frontend
-    ports:
-      - "3000:3000"
+    restart: unless-stopped
     depends_on:
       - backend
 
+  caddy:
+    image: caddy:2.8-alpine
+    container_name: rent-caddy
+    restart: unless-stopped
+    depends_on:
+      - frontend
+      - backend
+    environment:
+      DOMAIN: ${DOMAIN:-localhost}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
 volumes:
-  rent_data:
+  postgres_data:
+  caddy_data:
+  caddy_config:

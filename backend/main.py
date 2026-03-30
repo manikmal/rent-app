@@ -1,27 +1,48 @@
 import json
+import hmac
+import math
 import os
 import re
-import sqlite3
-from html import escape
 from contextlib import closing
-from datetime import date, datetime
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+from datetime import date, datetime, timedelta
+from html import escape
+from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, Form, HTTPException, Response
+from fastapi import FastAPI, Form, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from db import Connection, Row, get_connection, init_db, row_to_dict
 
-DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
-DB_PATH = DATA_DIR / "rent_management.db"
+SESSION_COOKIE_NAME = "rentdesk_session"
+SESSION_MAX_AGE_HOURS = int(os.getenv("SESSION_MAX_AGE_HOURS", "12"))
+SESSION_SECRET = os.getenv("APP_SESSION_SECRET", "change-this-session-secret")
+COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() == "true"
+APP_USERS_ENV = os.getenv("APP_USERS", "admin:changeme")
+PUBLIC_PATH_PREFIXES = (
+    "/health",
+    "/auth/login",
+    "/webhooks/whatsapp",
+)
+PUBLIC_EXACT_PATHS = {"/", "/favicon.ico"}
 
+
+def parse_allowed_origins() -> List[str]:
+    origins = os.getenv(
+        "ALLOW_ORIGINS",
+        "http://localhost:3000,http://127.0.0.1:3000",
+    )
+    return [item.strip() for item in origins.split(",") if item.strip()]
+
+
+ALLOWED_ORIGINS = parse_allowed_origins()
+ALLOW_CREDENTIALS = "*" not in ALLOWED_ORIGINS
 
 app = FastAPI(title="Rent Management MVP")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=ALLOW_CREDENTIALS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -29,6 +50,11 @@ app.add_middleware(
 
 class PaymentRequest(BaseModel):
     message: str
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
 
 
 class RentIncreaseRequest(BaseModel):
@@ -44,6 +70,13 @@ class PropertyCreateRequest(BaseModel):
     rent_due_day: Optional[int] = None
     lease_start: Optional[str] = None
     lease_end: Optional[str] = None
+    phone_number: Optional[str] = None
+    unit_number: Optional[str] = None
+    property_address: Optional[str] = None
+    security_deposit: Optional[float] = None
+    lease_terms: Optional[str] = None
+    emergency_contact_name: Optional[str] = None
+    emergency_contact_phone: Optional[str] = None
     rent_increases: List[RentIncreaseRequest] = Field(default_factory=list)
 
 
@@ -55,360 +88,194 @@ class ManualMatchRequest(BaseModel):
     sender_key: Optional[str] = None
 
 
+class InboxMatchRequest(BaseModel):
+    property_id: int
+    sender_key: Optional[str] = None
+    note: Optional[str] = None
+
+
+class ReviewDecisionRequest(BaseModel):
+    note: Optional[str] = None
+
+
+class UndoPaymentRequest(BaseModel):
+    reason: Optional[str] = None
+
+
 class WhatsAppInboundPayload(BaseModel):
     body: str
     wa_id: Optional[str] = None
     profile_name: Optional[str] = None
 
 
-def get_connection() -> sqlite3.Connection:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+def parse_app_users() -> Dict[str, str]:
+    users: Dict[str, str] = {}
+    for item in APP_USERS_ENV.split(","):
+        if ":" not in item:
+            continue
+        username, password = item.split(":", 1)
+        username = username.strip()
+        password = password.strip()
+        if username and password:
+            users[username] = password
+    if not users:
+        users["admin"] = "changeme"
+    return users
 
 
-def init_db() -> None:
-    with closing(get_connection()) as conn:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS unmatched_payments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                raw_message TEXT NOT NULL,
-                extracted_tenant_name TEXT,
-                sender_key TEXT,
-                amount REAL NOT NULL,
-                payment_date TEXT NOT NULL,
-                candidates_json TEXT NOT NULL DEFAULT '[]',
-                status TEXT NOT NULL DEFAULT 'UNMATCHED',
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            );
+APP_USERS = parse_app_users()
 
-            CREATE TABLE IF NOT EXISTS tenant_aliases (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                property_id INTEGER NOT NULL,
-                sender_key TEXT NOT NULL UNIQUE,
-                sender_name TEXT,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY(property_id) REFERENCES properties(id)
-            );
 
-            CREATE TABLE IF NOT EXISTS whatsapp_pending_matches (
-                wa_id TEXT PRIMARY KEY,
-                original_message TEXT NOT NULL,
-                amount REAL NOT NULL,
-                payment_date TEXT NOT NULL,
-                sender_key TEXT,
-                sender_name TEXT,
-                unmatched_payment_id INTEGER,
-                candidates_json TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            );
+def build_session_token(username: str) -> str:
+    expires_at = int((datetime.utcnow() + timedelta(hours=SESSION_MAX_AGE_HOURS)).timestamp())
+    payload = f"{username}|{expires_at}"
+    signature = hmac.new(
+        SESSION_SECRET.encode("utf-8"),
+        payload.encode("utf-8"),
+        "sha256",
+    ).hexdigest()
+    return f"{payload}|{signature}"
 
-            CREATE TABLE IF NOT EXISTS rent_increases (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                property_id INTEGER NOT NULL,
-                date_from TEXT NOT NULL,
-                date_till TEXT NOT NULL,
-                rent_amount REAL NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY(property_id) REFERENCES properties(id)
-            );
-            """
+
+def get_authenticated_username(session_token: Optional[str]) -> Optional[str]:
+    if not session_token:
+        return None
+
+    try:
+        username, expires_at, signature = session_token.split("|", 2)
+    except ValueError:
+        return None
+
+    payload = f"{username}|{expires_at}"
+    expected_signature = hmac.new(
+        SESSION_SECRET.encode("utf-8"),
+        payload.encode("utf-8"),
+        "sha256",
+    ).hexdigest()
+
+    if not hmac.compare_digest(signature, expected_signature):
+        return None
+
+    try:
+        expires_ts = int(expires_at)
+    except ValueError:
+        return None
+
+    if datetime.utcnow().timestamp() > expires_ts:
+        return None
+
+    if username not in APP_USERS:
+        return None
+
+    return username
+
+
+def require_authenticated_user(request: Request) -> str:
+    username = get_authenticated_username(request.cookies.get(SESSION_COOKIE_NAME))
+    if not username:
+        raise HTTPException(status_code=401, detail="Authentication required.")
+    return username
+
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    if request.method == "OPTIONS":
+        return await call_next(request)
+
+    if request.url.path in PUBLIC_EXACT_PATHS or request.url.path.startswith(PUBLIC_PATH_PREFIXES):
+        return await call_next(request)
+
+    username = get_authenticated_username(request.cookies.get(SESSION_COOKIE_NAME))
+    if not username:
+        return Response(
+            content=json.dumps({"detail": "Authentication required."}),
+            status_code=401,
+            media_type="application/json",
         )
-        migrate_properties_table(conn)
-        ensure_column(conn, "unmatched_payments", "sender_key", "TEXT")
-        ensure_column(conn, "properties", "current_month_paid_amount", "REAL")
-        ensure_column(conn, "properties", "property_name", "TEXT")
-        conn.execute("UPDATE properties SET property_name = tenant_name WHERE property_name IS NULL OR property_name = ''")
-        conn.commit()
+
+    request.state.username = username
+    return await call_next(request)
 
 
 def normalize_name(value: str) -> str:
     return re.sub(r"\s+", " ", value.strip().lower())
 
 
-def ensure_column(conn: sqlite3.Connection, table_name: str, column_name: str, column_type: str) -> None:
-    columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
-    if column_name not in columns:
-        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
+def clean_optional_text(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    cleaned = value.strip()
+    return cleaned or None
 
 
-def migrate_properties_table(conn: sqlite3.Connection) -> None:
-    table_exists = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'properties'"
-    ).fetchone()
-    if not table_exists:
-        conn.execute(
-            """
-            CREATE TABLE properties (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                tenant_name TEXT NOT NULL,
-                property_name TEXT,
-                rent_amount REAL NOT NULL,
-                rent_due_day INTEGER,
-                lease_start TEXT,
-                lease_end TEXT,
-                status TEXT NOT NULL DEFAULT 'PENDING',
-                last_paid_date TEXT,
-                last_payment_amount REAL,
-                current_month_paid_amount REAL
-            )
-            """
-        )
-        return
-
-    columns = {
-        row["name"]: dict(row) for row in conn.execute("PRAGMA table_info(properties)").fetchall()
-    }
-    needs_migration = not columns or any(
-        columns.get(name, {}).get("notnull") == 1
-        for name in ("rent_due_day", "lease_start", "lease_end")
-    )
-    if not needs_migration:
-        return
-
-    conn.executescript(
-        """
-        ALTER TABLE properties RENAME TO properties_legacy;
-
-        CREATE TABLE properties (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tenant_name TEXT NOT NULL,
-            property_name TEXT,
-            rent_amount REAL NOT NULL,
-            rent_due_day INTEGER,
-            lease_start TEXT,
-            lease_end TEXT,
-            status TEXT NOT NULL DEFAULT 'PENDING',
-            last_paid_date TEXT,
-            last_payment_amount REAL,
-            current_month_paid_amount REAL
-        );
-
-        INSERT INTO properties (
-            id,
-            tenant_name,
-            property_name,
-            rent_amount,
-            rent_due_day,
-            lease_start,
-            lease_end,
-            status,
-            last_paid_date,
-            last_payment_amount,
-            current_month_paid_amount
-        )
-        SELECT
-            id,
-            tenant_name,
-            tenant_name,
-            rent_amount,
-            NULLIF(rent_due_day, 0),
-            NULLIF(lease_start, ''),
-            NULLIF(lease_end, ''),
-            status,
-            last_paid_date,
-            last_payment_amount,
-            NULL
-        FROM properties_legacy;
-
-        DROP TABLE properties_legacy;
-        """
-    )
+def validate_amount(value: float, label: str, *, allow_zero: bool = False) -> float:
+    amount = float(value)
+    if not math.isfinite(amount):
+        raise HTTPException(status_code=400, detail=f"{label} must be a finite number.")
+    if allow_zero:
+        if amount < 0:
+            raise HTTPException(status_code=400, detail=f"{label} cannot be negative.")
+    elif amount <= 0:
+        raise HTTPException(status_code=400, detail=f"{label} must be greater than 0.")
+    return round(amount, 2)
 
 
-def parse_amount(message: str) -> float:
-    match = re.search(r"Rs\.?\s?([\d,]+\.\d+)", message)
-    if not match:
-        raise ValueError("Could not extract amount from payment message.")
-    return float(match.group(1).replace(",", ""))
+def parse_iso_date(value: str, label: str) -> str:
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").strftime("%Y-%m-%d")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"{label} must be YYYY-MM-DD.") from exc
 
 
-def parse_payment_date(message: str) -> str:
-    match = re.search(r"(\d{1,2}-[A-Za-z]{3}-\d{2})", message)
-    if not match:
-        raise ValueError("Could not extract payment date from payment message.")
-    parsed = datetime.strptime(match.group(1), "%d-%b-%y")
-    return parsed.strftime("%Y-%m-%d")
+def parse_month_reference(month: Optional[str]) -> date:
+    if not month:
+        today = date.today()
+        return today.replace(day=1)
+    try:
+        parsed = datetime.strptime(month, "%Y-%m").date()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Month must be YYYY-MM.") from exc
+    return parsed.replace(day=1)
 
 
-def parse_sender_details(message: str) -> Dict[str, Optional[str]]:
-    match = re.search(r"NEFT-([A-Z0-9]+)-([A-Z][A-Z\s]*)", message.upper())
-    if not match:
-        return {"sender_key": None, "sender_name": None}
-    return {
-        "sender_key": match.group(1).strip(),
-        "sender_name": normalize_name(match.group(2)),
-    }
+def month_start(reference_date: date) -> date:
+    return reference_date.replace(day=1)
 
 
-def calculate_status(row: sqlite3.Row, today: Optional[date] = None) -> str:
-    today = today or date.today()
-    paid_amount = paid_amount_for_row(row, today)
-    rent_amount = rent_amount_for_period(row, today)
-    if paid_amount > rent_amount > 0:
-        return "SURPLUS"
-    if paid_amount == rent_amount and rent_amount > 0:
-        return "PAID"
-    if paid_amount > 0:
-        return "PARTIALLY_PAID"
-    rent_due_day = row["rent_due_day"]
-    if rent_due_day is None:
-        return "PENDING"
-    if today.day > int(rent_due_day):
-        return "LATE"
-    return "PENDING"
+def add_months(reference_date: date, months: int) -> date:
+    zero_based_month = reference_date.month - 1 + months
+    year = reference_date.year + zero_based_month // 12
+    month = zero_based_month % 12 + 1
+    return date(year, month, 1)
 
 
-def refresh_all_statuses() -> None:
-    with closing(get_connection()) as conn:
-        rows = conn.execute("SELECT * FROM properties").fetchall()
-        for row in rows:
-            status = calculate_status(row)
-            conn.execute("UPDATE properties SET status = ? WHERE id = ?", (status, row["id"]))
-        conn.commit()
+def last_day_of_month(reference_date: date) -> date:
+    return add_months(reference_date.replace(day=1), 1) - timedelta(days=1)
 
 
-def row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
-    return dict(row)
-
-
-def paid_amount_for_row(row: sqlite3.Row, reference_date: Optional[date] = None) -> float:
-    reference_date = reference_date or date.today()
-    if not row["last_paid_date"]:
-        return 0.0
-    last_paid_dt = datetime.strptime(row["last_paid_date"], "%Y-%m-%d").date()
-    if last_paid_dt.year != reference_date.year or last_paid_dt.month != reference_date.month:
-        return 0.0
-    if row["current_month_paid_amount"] is not None:
-        return float(row["current_month_paid_amount"])
-    return float(row["last_payment_amount"] or 0)
+def format_month(reference_date: date) -> str:
+    return reference_date.strftime("%Y-%m")
 
 
 def get_rent_increases_for_property(
-    property_id: int, conn: Optional[sqlite3.Connection] = None
+    property_id: int,
+    conn: Connection,
 ) -> List[Dict[str, Any]]:
-    should_close = conn is None
-    local_conn = conn or get_connection()
-    try:
-        rows = local_conn.execute(
-            "SELECT id, property_id, date_from, date_till, rent_amount FROM rent_increases WHERE property_id = ? ORDER BY date_from ASC, id ASC",
-            (property_id,),
-        ).fetchall()
-        return [row_to_dict(row) for row in rows]
-    finally:
-        if should_close:
-            local_conn.close()
+    rows = conn.execute(
+        """
+        SELECT id, property_id, date_from, date_till, rent_amount
+        FROM rent_increases
+        WHERE property_id = ?
+        ORDER BY date_from ASC, id ASC
+        """,
+        (property_id,),
+    ).fetchall()
+    return [row_to_dict(row) for row in rows]
 
 
-def rent_amount_for_period(
-    row: sqlite3.Row,
-    reference_date: Optional[date] = None,
-    rent_increases: Optional[List[Dict[str, Any]]] = None,
-) -> float:
-    reference_date = reference_date or date.today()
-    increases = rent_increases if rent_increases is not None else get_rent_increases_for_property(int(row["id"]))
-    for increase in increases:
-        start_dt = datetime.strptime(increase["date_from"], "%Y-%m-%d").date()
-        end_dt = datetime.strptime(increase["date_till"], "%Y-%m-%d").date()
-        if start_dt <= reference_date <= end_dt:
-            return round(float(increase["rent_amount"]), 2)
-    return round(float(row["rent_amount"] or 0), 2)
-
-
-def balance_amount_for_row(row: sqlite3.Row, reference_date: Optional[date] = None) -> float:
-    reference_date = reference_date or date.today()
-    expected_rent = rent_amount_for_period(row, reference_date)
-    return round(max(expected_rent - paid_amount_for_row(row, reference_date), 0), 2)
-
-
-def surplus_amount_for_row(row: sqlite3.Row, reference_date: Optional[date] = None) -> float:
-    reference_date = reference_date or date.today()
-    expected_rent = rent_amount_for_period(row, reference_date)
-    return round(max(paid_amount_for_row(row, reference_date) - expected_rent, 0), 2)
-
-
-def enrich_property(row: sqlite3.Row) -> Dict[str, Any]:
-    rent_increases = get_rent_increases_for_property(int(row["id"]))
-    paid_amount = round(paid_amount_for_row(row), 2)
-    current_rent_amount = rent_amount_for_period(row, rent_increases=rent_increases)
-    return {
-        **row_to_dict(row),
-        "status": calculate_status(row),
-        "balance_amount": balance_amount_for_row(row),
-        "surplus_amount": surplus_amount_for_row(row),
-        "current_month_paid_amount": paid_amount,
-        "current_rent_amount": current_rent_amount,
-        "rent_increases": rent_increases,
-    }
-
-
-def candidate_properties(extracted_name: str) -> List[Dict[str, Any]]:
-    normalized_target = normalize_name(extracted_name)
-    with closing(get_connection()) as conn:
-        properties = conn.execute("SELECT * FROM properties").fetchall()
-
-    matches = []
-    for prop in properties:
-        tenant_name = normalize_name(prop["tenant_name"])
-        if normalized_target in tenant_name or tenant_name in normalized_target:
-            candidate = row_to_dict(prop)
-            candidate["status"] = calculate_status(prop)
-            candidate["balance_amount"] = balance_amount_for_row(prop)
-            candidate["surplus_amount"] = surplus_amount_for_row(prop)
-            candidate["current_month_paid_amount"] = round(paid_amount_for_row(prop), 2)
-            candidate["current_rent_amount"] = rent_amount_for_period(prop)
-            candidate["rent_increases"] = get_rent_increases_for_property(int(prop["id"]))
-            matches.append(candidate)
-    return matches
-
-
-def all_properties() -> List[Dict[str, Any]]:
-    with closing(get_connection()) as conn:
-        rows = conn.execute("SELECT * FROM properties ORDER BY id DESC").fetchall()
-    return [enrich_property(row) for row in rows]
-
-
-def find_property_by_sender_key(sender_key: str) -> Optional[Dict[str, Any]]:
-    if not sender_key:
-        return None
-    with closing(get_connection()) as conn:
-        row = conn.execute(
-            """
-            SELECT p.*
-            FROM tenant_aliases ta
-            JOIN properties p ON p.id = ta.property_id
-            WHERE ta.sender_key = ?
-            """,
-            (sender_key,),
-        ).fetchone()
-    if not row:
-        return None
-    return enrich_property(row)
-
-
-def calculate_payment_totals(row: sqlite3.Row, payment_amount: float, payment_date: str) -> Dict[str, float]:
-    payment_dt = datetime.strptime(payment_date, "%Y-%m-%d").date()
-    existing_total = paid_amount_for_row(row, payment_dt)
-
-    total_paid = round(existing_total + payment_amount, 2)
-    rent_amount = rent_amount_for_period(row, payment_dt)
-    balance_amount = round(max(rent_amount - total_paid, 0), 2)
-    surplus_amount = round(max(total_paid - rent_amount, 0), 2)
-    return {
-        "total_paid": total_paid,
-        "rent_amount": rent_amount,
-        "balance_amount": balance_amount,
-        "surplus_amount": surplus_amount,
-    }
-
-
-def normalize_rent_increases(
-    rent_increases: List[RentIncreaseRequest],
-) -> List[Dict[str, Any]]:
-    normalized = []
-    parsed_ranges = []
+def normalize_rent_increases(rent_increases: List[RentIncreaseRequest]) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    parsed_ranges: List[Tuple[date, date]] = []
 
     for item in rent_increases:
         try:
@@ -416,22 +283,24 @@ def normalize_rent_increases(
             date_till = datetime.strptime(item.date_till, "%Y-%m-%d").date()
         except ValueError as exc:
             raise HTTPException(
-                status_code=400, detail="Rent increase dates must be YYYY-MM-DD."
+                status_code=400,
+                detail="Rent increase dates must be YYYY-MM-DD.",
             ) from exc
 
         if date_till < date_from:
             raise HTTPException(
-                status_code=400, detail="Rent increase end date must be on or after start date."
+                status_code=400,
+                detail="Rent increase end date must be on or after start date.",
             )
 
-        parsed_ranges.append((date_from, date_till))
         normalized.append(
             {
                 "date_from": date_from.strftime("%Y-%m-%d"),
                 "date_till": date_till.strftime("%Y-%m-%d"),
-                "rent_amount": round(float(item.rent_amount), 2),
+                "rent_amount": validate_amount(item.rent_amount, "Rent increase amount"),
             }
         )
+        parsed_ranges.append((date_from, date_till))
 
     ordered_ranges = sorted(parsed_ranges)
     for index in range(1, len(ordered_ranges)):
@@ -447,7 +316,9 @@ def normalize_rent_increases(
 
 
 def save_rent_increases(
-    conn: sqlite3.Connection, property_id: int, rent_increases: List[Dict[str, Any]]
+    conn: Connection,
+    property_id: int,
+    rent_increases: List[Dict[str, Any]],
 ) -> None:
     conn.execute("DELETE FROM rent_increases WHERE property_id = ?", (property_id,))
     for item in rent_increases:
@@ -460,48 +331,326 @@ def save_rent_increases(
         )
 
 
-def apply_payment_to_property(property_id: int, payment_amount: float, payment_date: str) -> Dict[str, Any]:
-    with closing(get_connection()) as conn:
-        property_row = conn.execute("SELECT * FROM properties WHERE id = ?", (property_id,)).fetchone()
-        if not property_row:
-            raise HTTPException(status_code=404, detail="Property not found.")
+def rent_amount_for_period(
+    row: Row,
+    reference_date: date,
+    rent_increases: List[Dict[str, Any]],
+) -> float:
+    for increase in rent_increases:
+        start_dt = datetime.strptime(increase["date_from"], "%Y-%m-%d").date()
+        end_dt = datetime.strptime(increase["date_till"], "%Y-%m-%d").date()
+        if start_dt <= reference_date <= end_dt:
+            return round(float(increase["rent_amount"]), 2)
+    return round(float(row["rent_amount"] or 0), 2)
 
-        totals = calculate_payment_totals(property_row, payment_amount, payment_date)
-        status = "SURPLUS" if totals["surplus_amount"] > 0 else "PAID" if totals["balance_amount"] == 0 else "PARTIALLY_PAID"
 
-        conn.execute(
-            """
-            UPDATE properties
-            SET status = ?, last_paid_date = ?, last_payment_amount = ?, current_month_paid_amount = ?
-            WHERE id = ?
-            """,
-            (status, payment_date, payment_amount, totals["total_paid"], property_id),
+def sum_posted_payments_for_period(
+    conn: Connection,
+    property_id: int,
+    reference_date: date,
+) -> float:
+    start_date = month_start(reference_date).strftime("%Y-%m-%d")
+    end_date = last_day_of_month(reference_date).strftime("%Y-%m-%d")
+    row = conn.execute(
+        """
+        SELECT COALESCE(SUM(amount), 0) AS total
+        FROM payments
+        WHERE property_id = ?
+          AND status = 'POSTED'
+          AND payment_date BETWEEN ? AND ?
+        """,
+        (property_id, start_date, end_date),
+    ).fetchone()
+    return round(float(row["total"] or 0), 2)
+
+
+def latest_posted_payment(
+    conn: Connection,
+    property_id: int,
+) -> Optional[Row]:
+    return conn.execute(
+        """
+        SELECT *
+        FROM payments
+        WHERE property_id = ? AND status = 'POSTED'
+        ORDER BY payment_date DESC, id DESC
+        LIMIT 1
+        """,
+        (property_id,),
+    ).fetchone()
+
+
+def status_for_period(
+    row: Row,
+    reference_date: date,
+    expected_rent: float,
+    collected_amount: float,
+) -> str:
+    if collected_amount > expected_rent > 0:
+        return "SURPLUS"
+    if collected_amount == expected_rent and expected_rent > 0:
+        return "PAID"
+    if collected_amount > 0:
+        return "PARTIALLY_PAID"
+
+    rent_due_day = row["rent_due_day"]
+    if rent_due_day is None:
+        return "PENDING"
+
+    today = date.today()
+    due_day = min(int(rent_due_day), last_day_of_month(reference_date).day)
+    due_date = reference_date.replace(day=due_day)
+
+    if reference_date.year < today.year or (
+        reference_date.year == today.year and reference_date.month < today.month
+    ):
+        return "LATE"
+
+    if reference_date.year == today.year and reference_date.month == today.month and today > due_date:
+        return "LATE"
+
+    return "PENDING"
+
+
+def sync_property_cache(conn: Connection, property_id: int) -> None:
+    property_row = conn.execute("SELECT * FROM properties WHERE id = ?", (property_id,)).fetchone()
+    if not property_row:
+        return
+
+    reference_date = date.today()
+    rent_increases = get_rent_increases_for_property(property_id, conn)
+    expected_rent = rent_amount_for_period(property_row, reference_date, rent_increases)
+    collected_amount = sum_posted_payments_for_period(conn, property_id, reference_date)
+    status = status_for_period(property_row, reference_date, expected_rent, collected_amount)
+    latest_payment = latest_posted_payment(conn, property_id)
+
+    conn.execute(
+        """
+        UPDATE properties
+        SET status = ?,
+            last_paid_date = ?,
+            last_payment_amount = ?,
+            current_month_paid_amount = ?
+        WHERE id = ?
+        """,
+        (
+            status,
+            latest_payment["payment_date"] if latest_payment else None,
+            round(float(latest_payment["amount"]), 2) if latest_payment else None,
+            collected_amount,
+            property_id,
+        ),
+    )
+
+
+def enrich_property(
+    row: Row,
+    reference_date: date,
+    conn: Connection,
+) -> Dict[str, Any]:
+    property_id = int(row["id"])
+    rent_increases = get_rent_increases_for_property(property_id, conn)
+    current_rent_amount = rent_amount_for_period(row, reference_date, rent_increases)
+    collected_amount = sum_posted_payments_for_period(conn, property_id, reference_date)
+    balance_amount = round(max(current_rent_amount - collected_amount, 0), 2)
+    surplus_amount = round(max(collected_amount - current_rent_amount, 0), 2)
+    status = status_for_period(row, reference_date, current_rent_amount, collected_amount)
+    due_date = None
+    if row["rent_due_day"] is not None:
+        due_date = reference_date.replace(
+            day=min(int(row["rent_due_day"]), last_day_of_month(reference_date).day)
+        ).strftime("%Y-%m-%d")
+
+    return {
+        **row_to_dict(row),
+        "status": status,
+        "selected_month": format_month(reference_date),
+        "current_rent_amount": current_rent_amount,
+        "current_month_paid_amount": collected_amount,
+        "balance_amount": balance_amount,
+        "surplus_amount": surplus_amount,
+        "rent_increases": rent_increases,
+        "due_date": due_date,
+    }
+
+
+def filter_and_sort_properties(
+    items: List[Dict[str, Any]],
+    query: str,
+    status: str,
+    sort: str,
+) -> List[Dict[str, Any]]:
+    normalized_query = normalize_name(query) if query.strip() else ""
+    filtered = items
+
+    if normalized_query:
+        filtered = [
+            item
+            for item in filtered
+            if normalized_query in normalize_name(item["tenant_name"])
+            or normalized_query in normalize_name(item.get("property_name") or "")
+            or normalized_query in normalize_name(item.get("unit_number") or "")
+            or normalized_query in normalize_name(item.get("phone_number") or "")
+            or normalized_query in normalize_name(item.get("property_address") or "")
+        ]
+
+    normalized_status = status.strip().upper()
+    if normalized_status and normalized_status != "ALL":
+        filtered = [item for item in filtered if item["status"] == normalized_status]
+
+    if sort == "rent_desc":
+        filtered.sort(key=lambda item: (-float(item["current_rent_amount"]), normalize_name(item["tenant_name"])))
+    elif sort == "outstanding_desc":
+        filtered.sort(key=lambda item: (-float(item["balance_amount"]), normalize_name(item["tenant_name"])))
+    elif sort == "due_soon":
+        filtered.sort(
+            key=lambda item: (
+                item["due_date"] or "9999-12-31",
+                -float(item["balance_amount"]),
+                normalize_name(item["tenant_name"]),
+            )
         )
-        conn.commit()
-        updated_row = conn.execute("SELECT * FROM properties WHERE id = ?", (property_id,)).fetchone()
+    elif sort == "recent_payment":
+        filtered.sort(
+            key=lambda item: (
+                item.get("last_paid_date") or "0000-00-00",
+                item.get("last_payment_amount") or 0,
+            ),
+            reverse=True,
+        )
+    elif sort == "tenant_desc":
+        filtered.sort(key=lambda item: normalize_name(item["tenant_name"]), reverse=True)
+    else:
+        filtered.sort(key=lambda item: normalize_name(item["tenant_name"]))
 
-    enriched = enrich_property(updated_row)
-    enriched["last_payment_amount"] = round(float(payment_amount), 2)
-    return enriched
+    return filtered
 
 
-def mark_unmatched_payment_as_matched(unmatched_payment_id: Optional[int], amount: float, payment_date: str) -> None:
+def all_properties(
+    reference_date: date,
+    *,
+    query: str = "",
+    status: str = "ALL",
+    sort: str = "tenant_asc",
+) -> List[Dict[str, Any]]:
     with closing(get_connection()) as conn:
-        if unmatched_payment_id is not None:
-            conn.execute(
-                "UPDATE unmatched_payments SET status = 'MATCHED' WHERE id = ?",
-                (unmatched_payment_id,),
-            )
-        else:
-            conn.execute(
-                """
-                UPDATE unmatched_payments
-                SET status = 'MATCHED'
-                WHERE amount = ? AND payment_date = ? AND status = 'UNMATCHED'
-                """,
-                (amount, payment_date),
-            )
-        conn.commit()
+        rows = conn.execute("SELECT * FROM properties ORDER BY id DESC").fetchall()
+        items = [enrich_property(row, reference_date, conn) for row in rows]
+    return filter_and_sort_properties(items, query, status, sort)
+
+
+def find_property_by_sender_key(sender_key: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not sender_key:
+        return None
+    with closing(get_connection()) as conn:
+        row = conn.execute(
+            """
+            SELECT p.*
+            FROM tenant_aliases ta
+            JOIN properties p ON p.id = ta.property_id
+            WHERE ta.sender_key = ?
+            """,
+            (sender_key,),
+        ).fetchone()
+        if not row:
+            return None
+        return enrich_property(row, date.today(), conn)
+
+
+def candidate_properties(extracted_name: str, reference_date: date) -> List[Dict[str, Any]]:
+    normalized_target = normalize_name(extracted_name)
+    if not normalized_target:
+        return []
+
+    with closing(get_connection()) as conn:
+        rows = conn.execute("SELECT * FROM properties ORDER BY id DESC").fetchall()
+        matches: List[Dict[str, Any]] = []
+        for row in rows:
+            tenant_name = normalize_name(row["tenant_name"])
+            property_name = normalize_name(row["property_name"] or "")
+            if (
+                normalized_target in tenant_name
+                or tenant_name in normalized_target
+                or normalized_target in property_name
+            ):
+                matches.append(enrich_property(row, reference_date, conn))
+        return matches
+
+
+def serialize_payment(row: Row) -> Dict[str, Any]:
+    item = row_to_dict(row)
+    item["amount"] = round(float(item["amount"]), 2)
+    return item
+
+
+def get_payment_history_for_property(
+    conn: Connection,
+    property_id: int,
+    *,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    query = [
+        """
+        SELECT *
+        FROM payments
+        WHERE property_id = ?
+        """
+    ]
+    params: List[Any] = [property_id]
+
+    if date_from:
+        query.append("AND payment_date >= ?")
+        params.append(date_from)
+    if date_to:
+        query.append("AND payment_date <= ?")
+        params.append(date_to)
+
+    query.append("ORDER BY payment_date DESC, id DESC")
+    rows = conn.execute("\n".join(query), tuple(params)).fetchall()
+    return [serialize_payment(row) for row in rows]
+
+
+def summarize_payment_history(payments: List[Dict[str, Any]]) -> Dict[str, Any]:
+    posted_payments = [item for item in payments if item["status"] == "POSTED"]
+    reversed_payments = [item for item in payments if item["status"] != "POSTED"]
+    return {
+        "posted_count": len(posted_payments),
+        "reversed_count": len(reversed_payments),
+        "collected_total": round(sum(float(item["amount"]) for item in posted_payments), 2),
+        "last_collected_on": posted_payments[0]["payment_date"] if posted_payments else None,
+    }
+
+
+def build_monthly_history(
+    conn: Connection,
+    property_row: Row,
+    *,
+    months: int = 6,
+    reference_date: Optional[date] = None,
+) -> List[Dict[str, Any]]:
+    anchor = month_start(reference_date or date.today())
+    rent_increases = get_rent_increases_for_property(int(property_row["id"]), conn)
+    history: List[Dict[str, Any]] = []
+
+    for offset in range(months - 1, -1, -1):
+        month_ref = add_months(anchor, -offset)
+        expected = rent_amount_for_period(property_row, month_ref, rent_increases)
+        collected = sum_posted_payments_for_period(conn, int(property_row["id"]), month_ref)
+        balance = round(max(expected - collected, 0), 2)
+        surplus = round(max(collected - expected, 0), 2)
+        history.append(
+            {
+                "month": format_month(month_ref),
+                "expected": expected,
+                "collected": collected,
+                "balance": balance,
+                "surplus": surplus,
+                "status": status_for_period(property_row, month_ref, expected, collected),
+            }
+        )
+
+    return history
 
 
 def record_sender_alias(property_id: int, sender_key: Optional[str], sender_name: Optional[str]) -> None:
@@ -533,14 +682,475 @@ def save_unmatched_payment(
         cursor = conn.execute(
             """
             INSERT INTO unmatched_payments (
-                raw_message, extracted_tenant_name, sender_key, amount, payment_date, candidates_json
+                raw_message,
+                extracted_tenant_name,
+                sender_key,
+                amount,
+                payment_date,
+                candidates_json
             )
             VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (message, extracted_name, sender_key, amount, payment_date, json.dumps(candidates)),
+            (
+                message,
+                extracted_name,
+                sender_key,
+                amount,
+                payment_date,
+                json.dumps(candidates),
+            ),
         )
         conn.commit()
         return int(cursor.lastrowid)
+
+
+def set_unmatched_payment_status(
+    conn: Connection,
+    unmatched_payment_id: int,
+    status: str,
+    *,
+    note: Optional[str] = None,
+    matched_property_id: Optional[int] = None,
+    matched_payment_id: Optional[int] = None,
+) -> None:
+    existing = conn.execute(
+        "SELECT * FROM unmatched_payments WHERE id = ?",
+        (unmatched_payment_id,),
+    ).fetchone()
+    if not existing:
+        raise HTTPException(status_code=404, detail="Unmatched payment not found.")
+
+    conn.execute(
+        """
+        UPDATE unmatched_payments
+        SET status = ?,
+            matched_property_id = ?,
+            matched_payment_id = ?,
+            resolution_note = ?,
+            reviewed_at = ?
+        WHERE id = ?
+        """,
+        (
+            status,
+            matched_property_id,
+            matched_payment_id,
+            note,
+            datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            unmatched_payment_id,
+        ),
+    )
+
+
+def parse_amount(message: str) -> float:
+    match = re.search(r"Rs\.?\s?([\d,]+\.\d+)", message)
+    if not match:
+        raise ValueError("Could not extract amount from payment message.")
+    return validate_amount(float(match.group(1).replace(",", "")), "Payment amount")
+
+
+def parse_payment_date(message: str) -> str:
+    match = re.search(r"(\d{1,2}-[A-Za-z]{3}-\d{2})", message)
+    if not match:
+        raise ValueError("Could not extract payment date from payment message.")
+    parsed = datetime.strptime(match.group(1), "%d-%b-%y")
+    return parsed.strftime("%Y-%m-%d")
+
+
+def parse_sender_details(message: str) -> Dict[str, Optional[str]]:
+    match = re.search(r"NEFT-([A-Z0-9]+)-([A-Z][A-Z\s]*)", message.upper())
+    if not match:
+        return {"sender_key": None, "sender_name": None}
+    return {
+        "sender_key": match.group(1).strip(),
+        "sender_name": normalize_name(match.group(2)),
+    }
+
+
+def create_payment(
+    property_id: int,
+    amount: float,
+    payment_date: str,
+    *,
+    source: str,
+    sender_key: Optional[str] = None,
+    raw_message: Optional[str] = None,
+    unmatched_payment_id: Optional[int] = None,
+    note: Optional[str] = None,
+) -> Dict[str, Any]:
+    validated_amount = validate_amount(amount, "Payment amount")
+    normalized_date = parse_iso_date(payment_date, "Payment date")
+
+    with closing(get_connection()) as conn:
+        property_row = conn.execute("SELECT * FROM properties WHERE id = ?", (property_id,)).fetchone()
+        if not property_row:
+            raise HTTPException(status_code=404, detail="Property not found.")
+
+        cursor = conn.execute(
+            """
+            INSERT INTO payments (
+                property_id,
+                amount,
+                payment_date,
+                source,
+                status,
+                sender_key,
+                raw_message,
+                unmatched_payment_id,
+                note
+            )
+            VALUES (?, ?, ?, ?, 'POSTED', ?, ?, ?, ?)
+            """,
+            (
+                property_id,
+                validated_amount,
+                normalized_date,
+                source,
+                sender_key,
+                raw_message,
+                unmatched_payment_id,
+                clean_optional_text(note),
+            ),
+        )
+        payment_id = int(cursor.lastrowid)
+
+        if unmatched_payment_id is not None:
+            set_unmatched_payment_status(
+                conn,
+                unmatched_payment_id,
+                "MATCHED",
+                note=note,
+                matched_property_id=property_id,
+                matched_payment_id=payment_id,
+            )
+
+        sync_property_cache(conn, property_id)
+        conn.commit()
+
+        updated_row = conn.execute("SELECT * FROM properties WHERE id = ?", (property_id,)).fetchone()
+        payment_row = conn.execute("SELECT * FROM payments WHERE id = ?", (payment_id,)).fetchone()
+        summary = enrich_property(updated_row, month_start(datetime.strptime(normalized_date, "%Y-%m-%d").date()), conn)
+
+    return {
+        "payment": serialize_payment(payment_row),
+        "matched_property": summary,
+        "status": summary["status"],
+        "balance_amount": summary["balance_amount"],
+        "current_month_paid_amount": summary["current_month_paid_amount"],
+        "surplus_amount": summary["surplus_amount"],
+    }
+
+
+def process_payment_message(message: str) -> Dict[str, Any]:
+    try:
+        amount = parse_amount(message)
+        payment_date = parse_payment_date(message)
+        sender_details = parse_sender_details(message)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    matched_by_alias = find_property_by_sender_key(sender_details["sender_key"])
+    if matched_by_alias:
+        result = create_payment(
+            int(matched_by_alias["id"]),
+            amount,
+            payment_date,
+            source="auto_alias",
+            sender_key=sender_details["sender_key"],
+            raw_message=message,
+        )
+        record_sender_alias(
+            int(matched_by_alias["id"]),
+            sender_details["sender_key"],
+            sender_details["sender_name"],
+        )
+        return {
+            "status": result["status"],
+            "match_source": "saved_sender",
+            "matched_property": result["matched_property"],
+            "sender_key": sender_details["sender_key"],
+            "extracted_tenant_name": sender_details["sender_name"],
+            "amount": amount,
+            "balance_amount": result["balance_amount"],
+            "current_month_paid_amount": result["current_month_paid_amount"],
+            "surplus_amount": result["surplus_amount"],
+            "payment": result["payment"],
+        }
+
+    reference_date = month_start(datetime.strptime(payment_date, "%Y-%m-%d").date())
+    candidates = candidate_properties(sender_details["sender_name"] or "", reference_date)
+    fallback_candidates = candidates or all_properties(reference_date)
+    unmatched_id = save_unmatched_payment(
+        message,
+        sender_details["sender_name"] or "",
+        sender_details["sender_key"],
+        amount,
+        payment_date,
+        fallback_candidates,
+    )
+    return {
+        "status": "UNMATCHED",
+        "unmatched_payment_id": unmatched_id,
+        "candidates": fallback_candidates,
+        "extracted_tenant_name": sender_details["sender_name"],
+        "sender_key": sender_details["sender_key"],
+        "amount": amount,
+        "date": payment_date,
+        "matching_hint": "saved sender not found" if sender_details["sender_key"] else "sender could not be identified",
+    }
+
+
+def manual_match_payment(
+    property_id: int,
+    amount: float,
+    normalized_date: str,
+    *,
+    unmatched_payment_id: Optional[int] = None,
+    sender_key: Optional[str] = None,
+    raw_message: Optional[str] = None,
+    note: Optional[str] = None,
+) -> Dict[str, Any]:
+    result = create_payment(
+        property_id,
+        amount,
+        normalized_date,
+        source="manual_match",
+        sender_key=sender_key,
+        raw_message=raw_message,
+        unmatched_payment_id=unmatched_payment_id,
+        note=note,
+    )
+    record_sender_alias(property_id, sender_key, None)
+    return {
+        "status": result["status"],
+        "match_source": "manual",
+        "matched_property": result["matched_property"],
+        "sender_key": sender_key,
+        "balance_amount": result["balance_amount"],
+        "current_month_paid_amount": result["current_month_paid_amount"],
+        "surplus_amount": result["surplus_amount"],
+        "payment": result["payment"],
+    }
+
+
+def build_monthly_trends(reference_date: date) -> List[Dict[str, Any]]:
+    with closing(get_connection()) as conn:
+        property_rows = conn.execute("SELECT * FROM properties").fetchall()
+        trends: List[Dict[str, Any]] = []
+        for offset in range(5, -1, -1):
+            month_ref = add_months(month_start(reference_date), -offset)
+            expected = 0.0
+            collected = 0.0
+            outstanding = 0.0
+            for row in property_rows:
+                rent_increases = get_rent_increases_for_property(int(row["id"]), conn)
+                expected_rent = rent_amount_for_period(row, month_ref, rent_increases)
+                collected_amount = sum_posted_payments_for_period(conn, int(row["id"]), month_ref)
+                expected += expected_rent
+                collected += collected_amount
+                outstanding += max(expected_rent - collected_amount, 0)
+
+            unmatched_row = conn.execute(
+                """
+                SELECT COUNT(*) AS total
+                FROM unmatched_payments
+                WHERE to_char(payment_date, 'YYYY-MM') = ?
+                """,
+                (format_month(month_ref),),
+            ).fetchone()
+            trends.append(
+                {
+                    "month": format_month(month_ref),
+                    "expected": round(expected, 2),
+                    "collected": round(collected, 2),
+                    "outstanding": round(outstanding, 2),
+                    "unmatched": int(unmatched_row["total"] or 0),
+                }
+            )
+        return trends
+
+
+def build_reminders(reference_date: date, properties: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    reminders: List[Dict[str, Any]] = []
+    today = date.today()
+
+    expected_total = round(sum(float(item["current_rent_amount"]) for item in properties), 2)
+    collected_total = round(sum(float(item["current_month_paid_amount"]) for item in properties), 2)
+    reminders.append(
+        {
+            "type": "summary",
+            "severity": "info",
+            "title": f"{format_month(reference_date)} collection summary",
+            "description": f"Collected Rs. {collected_total:.2f} out of Rs. {expected_total:.2f}.",
+        }
+    )
+
+    for item in properties:
+        balance = float(item["balance_amount"])
+        if balance <= 0 or not item.get("due_date"):
+            continue
+
+        due_date = datetime.strptime(item["due_date"], "%Y-%m-%d").date()
+        days_until_due = (due_date - today).days
+        if reference_date.year == today.year and reference_date.month == today.month:
+            if 0 <= days_until_due <= 3:
+                reminders.append(
+                    {
+                        "type": "upcoming_due",
+                        "severity": "medium",
+                        "title": f"{item['tenant_name']} is due soon",
+                        "description": f"Rs. {balance:.2f} is still open for {item.get('property_name') or 'this property'} by {item['due_date']}.",
+                        "property_id": item["id"],
+                    }
+                )
+            elif days_until_due < 0:
+                reminders.append(
+                    {
+                        "type": "overdue",
+                        "severity": "high",
+                        "title": f"{item['tenant_name']} is overdue",
+                        "description": f"Rs. {balance:.2f} is overdue for {item.get('property_name') or 'this property'}.",
+                        "property_id": item["id"],
+                    }
+                )
+        elif reference_date < today.replace(day=1):
+            reminders.append(
+                {
+                    "type": "month_overdue",
+                    "severity": "high",
+                    "title": f"{item['tenant_name']} still has a past-month balance",
+                    "description": f"Rs. {balance:.2f} remained unpaid for {format_month(reference_date)}.",
+                    "property_id": item["id"],
+                }
+            )
+
+    with closing(get_connection()) as conn:
+        unmatched_open = conn.execute(
+            """
+            SELECT COUNT(*) AS total
+            FROM unmatched_payments
+            WHERE status = 'UNMATCHED'
+            """
+        ).fetchone()
+    if int(unmatched_open["total"] or 0) > 0:
+        reminders.append(
+            {
+                "type": "unmatched",
+                "severity": "high",
+                "title": "Unmatched payments need review",
+                "description": f"{int(unmatched_open['total'])} payment(s) are still waiting in the inbox.",
+            }
+        )
+
+    return reminders[:10]
+
+
+def build_attention_items(properties: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    items = [
+        item
+        for item in properties
+        if item["status"] in {"LATE", "PARTIALLY_PAID", "SURPLUS"} or float(item["balance_amount"]) > 0
+    ]
+    items.sort(
+        key=lambda item: (
+            -float(item["balance_amount"]),
+            -float(item["surplus_amount"]),
+            normalize_name(item["tenant_name"]),
+        )
+    )
+    return items[:6]
+
+
+def build_dashboard(reference_date: date) -> Dict[str, Any]:
+    properties = all_properties(reference_date)
+    reminders = build_reminders(reference_date, properties)
+    attention_items = build_attention_items(properties)
+    trends = build_monthly_trends(reference_date)
+
+    return {
+        "period": format_month(reference_date),
+        "metrics": {
+            "expected": round(sum(float(item["current_rent_amount"]) for item in properties), 2),
+            "collected": round(sum(float(item["current_month_paid_amount"]) for item in properties), 2),
+            "outstanding": round(sum(float(item["balance_amount"]) for item in properties), 2),
+            "surplus": round(sum(float(item["surplus_amount"]) for item in properties), 2),
+            "unmatched": len([item for item in get_unmatched_payments() if item["status"] == "UNMATCHED"]),
+            "needs_attention": len(attention_items),
+        },
+        "reminders": reminders,
+        "attention_items": attention_items,
+        "unpaid_items": [item for item in properties if float(item["balance_amount"]) > 0][:6],
+        "trends": trends,
+    }
+
+
+def validate_property_payload(payload: PropertyCreateRequest) -> Dict[str, Any]:
+    tenant_name = payload.tenant_name.strip()
+    if not tenant_name:
+        raise HTTPException(status_code=400, detail="Tenant name is required.")
+
+    property_name = payload.property_name.strip()
+    if not property_name:
+        raise HTTPException(status_code=400, detail="Property name is required.")
+
+    lease_start = clean_optional_text(payload.lease_start)
+    lease_end = clean_optional_text(payload.lease_end)
+    if lease_start:
+        lease_start = parse_iso_date(lease_start, "Lease start")
+    if lease_end:
+        lease_end = parse_iso_date(lease_end, "Lease end")
+    if lease_start and lease_end and lease_end < lease_start:
+        raise HTTPException(status_code=400, detail="Lease end must be on or after lease start.")
+
+    if payload.rent_due_day is not None and not 1 <= payload.rent_due_day <= 31:
+        raise HTTPException(status_code=400, detail="Rent due day must be between 1 and 31.")
+
+    return {
+        "tenant_name": tenant_name,
+        "property_name": property_name,
+        "rent_amount": validate_amount(payload.rent_amount, "Rent amount"),
+        "rent_due_day": payload.rent_due_day,
+        "lease_start": lease_start,
+        "lease_end": lease_end,
+        "phone_number": clean_optional_text(payload.phone_number),
+        "unit_number": clean_optional_text(payload.unit_number),
+        "property_address": clean_optional_text(payload.property_address),
+        "security_deposit": (
+            validate_amount(payload.security_deposit, "Security deposit", allow_zero=True)
+            if payload.security_deposit is not None
+            else None
+        ),
+        "lease_terms": clean_optional_text(payload.lease_terms),
+        "emergency_contact_name": clean_optional_text(payload.emergency_contact_name),
+        "emergency_contact_phone": clean_optional_text(payload.emergency_contact_phone),
+        "rent_increases": normalize_rent_increases(payload.rent_increases),
+    }
+
+
+def get_unmatched_payments(status: str = "UNMATCHED") -> List[Dict[str, Any]]:
+    with closing(get_connection()) as conn:
+        params: Tuple[Any, ...]
+        query = "SELECT * FROM unmatched_payments"
+        if status and status.upper() != "ALL":
+            query += " WHERE status = ?"
+            params = (status.upper(),)
+        else:
+            params = ()
+        query += " ORDER BY payment_date DESC, id DESC"
+        rows = conn.execute(query, params).fetchall()
+
+    items = []
+    for row in rows:
+        item = row_to_dict(row)
+        item["amount"] = round(float(item["amount"]), 2)
+        raw_candidates = item.pop("candidates_json")
+        item["candidates"] = json.loads(raw_candidates) if isinstance(raw_candidates, str) else raw_candidates
+        items.append(item)
+    return items
+
+
+def build_twiml_message(message: str) -> str:
+    escaped = escape(message)
+    return f'<?xml version="1.0" encoding="UTF-8"?><Response><Message>{escaped}</Message></Response>'
 
 
 def save_whatsapp_pending_match(
@@ -557,7 +1167,14 @@ def save_whatsapp_pending_match(
         conn.execute(
             """
             INSERT INTO whatsapp_pending_matches (
-                wa_id, original_message, amount, payment_date, sender_key, sender_name, unmatched_payment_id, candidates_json
+                wa_id,
+                original_message,
+                amount,
+                payment_date,
+                sender_key,
+                sender_name,
+                unmatched_payment_id,
+                candidates_json
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(wa_id) DO UPDATE SET
@@ -592,9 +1209,9 @@ def get_whatsapp_pending_match(wa_id: str) -> Optional[Dict[str, Any]]:
         ).fetchone()
     if not row:
         return None
-
     item = row_to_dict(row)
-    item["candidates"] = json.loads(item.pop("candidates_json"))
+    raw_candidates = item.pop("candidates_json")
+    item["candidates"] = json.loads(raw_candidates) if isinstance(raw_candidates, str) else raw_candidates
     return item
 
 
@@ -604,78 +1221,6 @@ def clear_whatsapp_pending_match(wa_id: str) -> None:
         conn.commit()
 
 
-def process_payment_message(message: str) -> Dict[str, Any]:
-    try:
-        amount = parse_amount(message)
-        payment_date = parse_payment_date(message)
-        sender_details = parse_sender_details(message)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    matched_by_alias = find_property_by_sender_key(sender_details["sender_key"])
-    if matched_by_alias:
-        matched_by_alias = apply_payment_to_property(matched_by_alias["id"], amount, payment_date)
-        return {
-            "status": matched_by_alias["status"],
-            "match_source": "saved_sender",
-            "matched_property": matched_by_alias,
-            "sender_key": sender_details["sender_key"],
-            "extracted_tenant_name": sender_details["sender_name"],
-            "balance_amount": matched_by_alias["balance_amount"],
-            "current_month_paid_amount": matched_by_alias["current_month_paid_amount"],
-            "surplus_amount": matched_by_alias["surplus_amount"],
-        }
-
-    candidates = candidate_properties(sender_details["sender_name"] or "")
-    fallback_candidates = candidates or all_properties()
-
-    unmatched_id = save_unmatched_payment(
-        message,
-        sender_details["sender_name"] or "",
-        sender_details["sender_key"],
-        amount,
-        payment_date,
-        fallback_candidates,
-    )
-    return {
-        "status": "UNMATCHED",
-        "unmatched_payment_id": unmatched_id,
-        "candidates": fallback_candidates,
-        "extracted_tenant_name": sender_details["sender_name"],
-        "sender_key": sender_details["sender_key"],
-        "amount": amount,
-        "date": payment_date,
-        "matching_hint": "saved sender not found" if sender_details["sender_key"] else "sender could not be identified",
-    }
-
-
-def manual_match_payment(
-    property_id: int,
-    amount: float,
-    normalized_date: str,
-    unmatched_payment_id: Optional[int] = None,
-    sender_key: Optional[str] = None,
-) -> Dict[str, Any]:
-    enriched = apply_payment_to_property(property_id, amount, normalized_date)
-    mark_unmatched_payment_as_matched(unmatched_payment_id, amount, normalized_date)
-    record_sender_alias(property_id, sender_key, None)
-
-    return {
-        "status": enriched["status"],
-        "match_source": "manual",
-        "matched_property": enriched,
-        "sender_key": sender_key,
-        "balance_amount": enriched["balance_amount"],
-        "current_month_paid_amount": enriched["current_month_paid_amount"],
-        "surplus_amount": enriched["surplus_amount"],
-    }
-
-
-def build_twiml_message(message: str) -> str:
-    escaped = escape(message)
-    return f'<?xml version="1.0" encoding="UTF-8"?><Response><Message>{escaped}</Message></Response>'
-
-
 def summarize_match(result: Dict[str, Any]) -> str:
     matched_property = result["matched_property"]
     parts = [
@@ -683,12 +1228,10 @@ def summarize_match(result: Dict[str, Any]) -> str:
         f"Status: {result['status']}.",
         f"Paid this month: Rs. {result['current_month_paid_amount']:.2f}.",
     ]
-    balance_amount = float(result.get("balance_amount") or 0)
-    surplus_amount = float(result.get("surplus_amount") or 0)
-    if surplus_amount > 0:
-        parts.append(f"Surplus: Rs. {surplus_amount:.2f}.")
+    if float(result.get("surplus_amount") or 0) > 0:
+        parts.append(f"Surplus: Rs. {float(result['surplus_amount']):.2f}.")
     else:
-        parts.append(f"Balance: Rs. {balance_amount:.2f}.")
+        parts.append(f"Balance: Rs. {float(result['balance_amount']):.2f}.")
     return " ".join(parts)
 
 
@@ -730,6 +1273,8 @@ def handle_whatsapp_selection(body: str, wa_id: str) -> Optional[str]:
         normalized_date=pending["payment_date"],
         unmatched_payment_id=pending.get("unmatched_payment_id"),
         sender_key=pending.get("sender_key"),
+        raw_message=pending.get("original_message"),
+        note="Matched from WhatsApp selection.",
     )
     clear_whatsapp_pending_match(wa_id)
     return summarize_match(result)
@@ -749,6 +1294,7 @@ def process_whatsapp_message(payload: WhatsAppInboundPayload) -> str:
         result = process_payment_message(body)
     except HTTPException as exc:
         return str(exc.detail)
+
     if result["status"] != "UNMATCHED":
         return summarize_match(result)
 
@@ -772,7 +1318,47 @@ def process_whatsapp_message(payload: WhatsAppInboundPayload) -> str:
 @app.on_event("startup")
 def startup() -> None:
     init_db()
-    refresh_all_statuses()
+    with closing(get_connection()) as conn:
+        property_rows = conn.execute("SELECT id FROM properties").fetchall()
+        for row in property_rows:
+            sync_property_cache(conn, int(row["id"]))
+        conn.commit()
+
+
+@app.post("/auth/login")
+def login(payload: LoginRequest, response: Response) -> Dict[str, Any]:
+    username = payload.username.strip()
+    password = payload.password
+
+    expected_password = APP_USERS.get(username)
+    if not expected_password or expected_password != password:
+        raise HTTPException(status_code=401, detail="Invalid username or password.")
+
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=build_session_token(username),
+        httponly=True,
+        secure=COOKIE_SECURE,
+        samesite="lax",
+        max_age=SESSION_MAX_AGE_HOURS * 3600,
+        path="/",
+    )
+    return {"username": username}
+
+
+@app.post("/auth/logout")
+def logout(response: Response) -> Dict[str, str]:
+    response.delete_cookie(
+        key=SESSION_COOKIE_NAME,
+        path="/",
+    )
+    return {"status": "logged_out"}
+
+
+@app.get("/auth/me")
+def auth_me(request: Request) -> Dict[str, str]:
+    username = require_authenticated_user(request)
+    return {"username": username}
 
 
 @app.get("/health")
@@ -780,38 +1366,70 @@ def health() -> Dict[str, str]:
     return {"status": "ok"}
 
 
-def validate_property_payload(payload: PropertyCreateRequest) -> Dict[str, Any]:
-    tenant_name = payload.tenant_name.strip()
-    if not tenant_name:
-        raise HTTPException(status_code=400, detail="Tenant name is required.")
-    property_name = payload.property_name.strip()
-    if not property_name:
-        raise HTTPException(status_code=400, detail="Property name is required.")
+@app.get("/dashboard")
+def dashboard(month: Optional[str] = None) -> Dict[str, Any]:
+    reference_date = parse_month_reference(month)
+    return build_dashboard(reference_date)
 
-    lease_start = None
-    lease_end = None
-    if payload.lease_start:
-        try:
-            lease_start = datetime.strptime(payload.lease_start, "%Y-%m-%d").strftime("%Y-%m-%d")
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail="Lease start must be YYYY-MM-DD.") from exc
-    if payload.lease_end:
-        try:
-            lease_end = datetime.strptime(payload.lease_end, "%Y-%m-%d").strftime("%Y-%m-%d")
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail="Lease end must be YYYY-MM-DD.") from exc
-    if payload.rent_due_day is not None and not 1 <= payload.rent_due_day <= 31:
-        raise HTTPException(status_code=400, detail="Rent due day must be between 1 and 31.")
-    rent_increases = normalize_rent_increases(payload.rent_increases)
 
+@app.get("/reminders")
+def reminders(month: Optional[str] = None) -> List[Dict[str, Any]]:
+    reference_date = parse_month_reference(month)
+    properties = all_properties(reference_date)
+    return build_reminders(reference_date, properties)
+
+
+@app.get("/properties")
+def get_properties(
+    month: Optional[str] = None,
+    q: str = "",
+    status: str = "ALL",
+    sort: str = "tenant_asc",
+) -> List[Dict[str, Any]]:
+    reference_date = parse_month_reference(month)
+    return all_properties(reference_date, query=q, status=status, sort=sort)
+
+
+@app.get("/properties/{property_id}/ledger")
+def get_property_ledger(
+    property_id: int,
+    month: Optional[str] = None,
+    history_from: Optional[str] = None,
+    history_to: Optional[str] = None,
+) -> Dict[str, Any]:
+    reference_date = parse_month_reference(month)
+    normalized_history_from = parse_iso_date(history_from, "History from") if history_from else None
+    normalized_history_to = parse_iso_date(history_to, "History to") if history_to else None
+    if normalized_history_from and normalized_history_to and normalized_history_to < normalized_history_from:
+        raise HTTPException(status_code=400, detail="History to must be on or after history from.")
+
+    with closing(get_connection()) as conn:
+        property_row = conn.execute("SELECT * FROM properties WHERE id = ?", (property_id,)).fetchone()
+        if not property_row:
+            raise HTTPException(status_code=404, detail="Property not found.")
+
+        summary = enrich_property(property_row, reference_date, conn)
+        payment_history = get_payment_history_for_property(
+            conn,
+            property_id,
+            date_from=normalized_history_from,
+            date_to=normalized_history_to,
+        )
+        monthly_history = build_monthly_history(conn, property_row, reference_date=reference_date)
+
+    tenant_reminders = [
+        item for item in build_reminders(reference_date, [summary]) if item.get("property_id") == property_id
+    ]
     return {
-        "tenant_name": tenant_name,
-        "property_name": property_name,
-        "rent_amount": round(float(payload.rent_amount), 2),
-        "rent_due_day": payload.rent_due_day,
-        "lease_start": lease_start,
-        "lease_end": lease_end,
-        "rent_increases": rent_increases,
+        "property": summary,
+        "payment_history": payment_history,
+        "payment_history_summary": summarize_payment_history(payment_history),
+        "payment_history_filters": {
+            "history_from": normalized_history_from,
+            "history_to": normalized_history_to,
+        },
+        "monthly_history": monthly_history,
+        "reminders": tenant_reminders,
     }
 
 
@@ -823,8 +1441,25 @@ def create_property(payload: PropertyCreateRequest) -> Dict[str, Any]:
         cursor = conn.execute(
             """
             INSERT INTO properties (
-                tenant_name, property_name, rent_amount, rent_due_day, lease_start, lease_end, status, last_paid_date, last_payment_amount, current_month_paid_amount
-            ) VALUES (?, ?, ?, ?, ?, ?, 'PENDING', NULL, NULL, NULL)
+                tenant_name,
+                property_name,
+                rent_amount,
+                rent_due_day,
+                lease_start,
+                lease_end,
+                phone_number,
+                unit_number,
+                property_address,
+                security_deposit,
+                lease_terms,
+                emergency_contact_name,
+                emergency_contact_phone,
+                status,
+                last_paid_date,
+                last_payment_amount,
+                current_month_paid_amount
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', NULL, NULL, 0)
             """,
             (
                 data["tenant_name"],
@@ -833,19 +1468,27 @@ def create_property(payload: PropertyCreateRequest) -> Dict[str, Any]:
                 data["rent_due_day"],
                 data["lease_start"],
                 data["lease_end"],
+                data["phone_number"],
+                data["unit_number"],
+                data["property_address"],
+                data["security_deposit"],
+                data["lease_terms"],
+                data["emergency_contact_name"],
+                data["emergency_contact_phone"],
             ),
         )
         property_id = int(cursor.lastrowid)
         save_rent_increases(conn, property_id, data["rent_increases"])
+        sync_property_cache(conn, property_id)
         conn.commit()
         row = conn.execute("SELECT * FROM properties WHERE id = ?", (property_id,)).fetchone()
-
-    return enrich_property(row)
+        return enrich_property(row, date.today().replace(day=1), conn)
 
 
 @app.put("/properties/{property_id}")
 def update_property(property_id: int, payload: PropertyCreateRequest) -> Dict[str, Any]:
     data = validate_property_payload(payload)
+
     with closing(get_connection()) as conn:
         existing_row = conn.execute("SELECT * FROM properties WHERE id = ?", (property_id,)).fetchone()
         if not existing_row:
@@ -854,7 +1497,19 @@ def update_property(property_id: int, payload: PropertyCreateRequest) -> Dict[st
         conn.execute(
             """
             UPDATE properties
-            SET tenant_name = ?, property_name = ?, rent_amount = ?, rent_due_day = ?, lease_start = ?, lease_end = ?
+            SET tenant_name = ?,
+                property_name = ?,
+                rent_amount = ?,
+                rent_due_day = ?,
+                lease_start = ?,
+                lease_end = ?,
+                phone_number = ?,
+                unit_number = ?,
+                property_address = ?,
+                security_deposit = ?,
+                lease_terms = ?,
+                emergency_contact_name = ?,
+                emergency_contact_phone = ?
             WHERE id = ?
             """,
             (
@@ -864,13 +1519,21 @@ def update_property(property_id: int, payload: PropertyCreateRequest) -> Dict[st
                 data["rent_due_day"],
                 data["lease_start"],
                 data["lease_end"],
+                data["phone_number"],
+                data["unit_number"],
+                data["property_address"],
+                data["security_deposit"],
+                data["lease_terms"],
+                data["emergency_contact_name"],
+                data["emergency_contact_phone"],
                 property_id,
             ),
         )
         save_rent_increases(conn, property_id, data["rent_increases"])
+        sync_property_cache(conn, property_id)
         conn.commit()
-        updated_row = conn.execute("SELECT * FROM properties WHERE id = ?", (property_id,)).fetchone()
-    return enrich_property(updated_row)
+        row = conn.execute("SELECT * FROM properties WHERE id = ?", (property_id,)).fetchone()
+        return enrich_property(row, date.today().replace(day=1), conn)
 
 
 @app.delete("/properties/{property_id}")
@@ -882,29 +1545,15 @@ def delete_property(property_id: int) -> Dict[str, Any]:
 
         conn.execute("DELETE FROM rent_increases WHERE property_id = ?", (property_id,))
         conn.execute("DELETE FROM tenant_aliases WHERE property_id = ?", (property_id,))
+        conn.execute("DELETE FROM payments WHERE property_id = ?", (property_id,))
         conn.execute("DELETE FROM properties WHERE id = ?", (property_id,))
         conn.commit()
     return {"status": "deleted", "property_id": property_id}
 
 
-@app.get("/properties")
-def get_properties() -> List[Dict[str, Any]]:
-    refresh_all_statuses()
-    return all_properties()
-
-
 @app.get("/unmatched-payments")
-def get_unmatched_payments() -> List[Dict[str, Any]]:
-    with closing(get_connection()) as conn:
-        rows = conn.execute(
-            "SELECT * FROM unmatched_payments WHERE status = 'UNMATCHED' ORDER BY id DESC"
-        ).fetchall()
-    result = []
-    for row in rows:
-        item = row_to_dict(row)
-        item["candidates"] = json.loads(item.pop("candidates_json"))
-        result.append(item)
-    return result
+def unmatched_payments(status: str = "UNMATCHED") -> List[Dict[str, Any]]:
+    return get_unmatched_payments(status=status)
 
 
 @app.post("/process-payment")
@@ -914,11 +1563,7 @@ def process_payment(payload: PaymentRequest) -> Dict[str, Any]:
 
 @app.post("/manual-match")
 def manual_match(payload: ManualMatchRequest) -> Dict[str, Any]:
-    try:
-        normalized_date = datetime.strptime(payload.date, "%Y-%m-%d").strftime("%Y-%m-%d")
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail="Date must be YYYY-MM-DD.") from exc
-
+    normalized_date = parse_iso_date(payload.date, "Date")
     return manual_match_payment(
         property_id=payload.property_id,
         amount=payload.amount,
@@ -926,6 +1571,113 @@ def manual_match(payload: ManualMatchRequest) -> Dict[str, Any]:
         unmatched_payment_id=payload.unmatched_payment_id,
         sender_key=payload.sender_key,
     )
+
+
+@app.post("/unmatched-payments/{unmatched_payment_id}/match")
+def review_match(unmatched_payment_id: int, payload: InboxMatchRequest) -> Dict[str, Any]:
+    with closing(get_connection()) as conn:
+        unmatched_row = conn.execute(
+            "SELECT * FROM unmatched_payments WHERE id = ?",
+            (unmatched_payment_id,),
+        ).fetchone()
+        if not unmatched_row:
+            raise HTTPException(status_code=404, detail="Unmatched payment not found.")
+        if unmatched_row["status"] != "UNMATCHED":
+            raise HTTPException(status_code=400, detail="This payment has already been reviewed.")
+
+    result = manual_match_payment(
+        property_id=payload.property_id,
+        amount=float(unmatched_row["amount"]),
+        normalized_date=unmatched_row["payment_date"],
+        unmatched_payment_id=unmatched_payment_id,
+        sender_key=payload.sender_key or unmatched_row["sender_key"],
+        raw_message=unmatched_row["raw_message"],
+        note=payload.note,
+    )
+    return result
+
+
+@app.post("/unmatched-payments/{unmatched_payment_id}/reject")
+def reject_unmatched_payment(
+    unmatched_payment_id: int,
+    payload: ReviewDecisionRequest,
+) -> Dict[str, Any]:
+    with closing(get_connection()) as conn:
+        set_unmatched_payment_status(
+            conn,
+            unmatched_payment_id,
+            "REJECTED",
+            note=payload.note or "Rejected from dashboard.",
+        )
+        conn.commit()
+    return {"status": "REJECTED", "unmatched_payment_id": unmatched_payment_id}
+
+
+@app.post("/unmatched-payments/{unmatched_payment_id}/duplicate")
+def mark_duplicate_unmatched_payment(
+    unmatched_payment_id: int,
+    payload: ReviewDecisionRequest,
+) -> Dict[str, Any]:
+    with closing(get_connection()) as conn:
+        set_unmatched_payment_status(
+            conn,
+            unmatched_payment_id,
+            "DUPLICATE",
+            note=payload.note or "Marked as duplicate from dashboard.",
+        )
+        conn.commit()
+    return {"status": "DUPLICATE", "unmatched_payment_id": unmatched_payment_id}
+
+
+@app.post("/payments/{payment_id}/undo")
+def undo_payment(payment_id: int, payload: UndoPaymentRequest) -> Dict[str, Any]:
+    with closing(get_connection()) as conn:
+        payment_row = conn.execute("SELECT * FROM payments WHERE id = ?", (payment_id,)).fetchone()
+        if not payment_row:
+            raise HTTPException(status_code=404, detail="Payment not found.")
+        if payment_row["status"] != "POSTED":
+            raise HTTPException(status_code=400, detail="Only posted payments can be undone.")
+
+        conn.execute(
+            """
+            UPDATE payments
+            SET status = 'REVERSED',
+                reversal_reason = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (clean_optional_text(payload.reason) or "Undone from dashboard.", payment_id),
+        )
+
+        if payment_row["unmatched_payment_id"] is not None:
+            conn.execute(
+                """
+                UPDATE unmatched_payments
+                SET status = 'UNMATCHED',
+                    matched_property_id = NULL,
+                    matched_payment_id = NULL,
+                    resolution_note = NULL,
+                    reviewed_at = NULL
+                WHERE id = ?
+                """,
+                (payment_row["unmatched_payment_id"],),
+            )
+
+        sync_property_cache(conn, int(payment_row["property_id"]))
+        conn.commit()
+
+        property_row = conn.execute(
+            "SELECT * FROM properties WHERE id = ?",
+            (payment_row["property_id"],),
+        ).fetchone()
+        summary = enrich_property(property_row, date.today().replace(day=1), conn)
+
+    return {
+        "status": "REVERSED",
+        "payment_id": payment_id,
+        "property_id": payment_row["property_id"],
+        "matched_property": summary,
+    }
 
 
 @app.post("/webhooks/whatsapp")
