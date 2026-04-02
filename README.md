@@ -31,7 +31,7 @@ cp .env.example .env
 Important variables:
 
 - `DOMAIN`
-  Your public domain or subdomain pointed at the Oracle VM
+  Your public domain or subdomain pointed at the machine hosting the app
 - `DATABASE_URL`
   PostgreSQL connection string used by the backend
 - `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`
@@ -130,6 +130,19 @@ docker exec rent-backend python -m unittest /app/test_main.py
 ```text
 https://<your-domain>/webhooks/whatsapp
 ```
+
+## Self-Hosting On Mac Or Windows
+
+If you want to host this on your own machine instead of a cloud VM, use:
+
+- your own domain or subdomain
+- router port forwarding for `80` and `443`
+- Caddy for HTTPS
+- Docker Compose for the stack
+
+Full guide:
+
+- [Self-hosting guide](/Users/manikmalhotra/Documents/projects/rent-app/docs/SELF_HOSTING.md)
 
 ## Notes
 

@@ -57,6 +57,14 @@ services:
       - caddy_data:/data
       - caddy_config:/config
 
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: rent-cloudflared
+    restart: unless-stopped
+    depends_on:
+      - caddy
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARED_TOKEN}
+
 volumes:
   postgres_data:
   caddy_data:

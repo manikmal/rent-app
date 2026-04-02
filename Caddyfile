@@ -1,4 +1,4 @@
-{$DOMAIN:localhost} {
+{$SITE_ADDRESS:http://:80} {
     encode gzip zstd
 
     handle /webhooks/whatsapp* {
