@@ -200,4 +200,12 @@ def table_exists(conn: Connection, table_name: str) -> bool:
 
 def bootstrap_schema(conn: Connection) -> None:
     conn.executescript(SCHEMA_PATH.read_text())
+    ensure_column(conn, "users", "whatsapp_number", "TEXT")
+    ensure_column(conn, "users", "last_login_at", "TIMESTAMP")
+    ensure_column(conn, "users", "whatsapp_onboarding_sent_at", "TIMESTAMP")
+    ensure_column(conn, "properties", "owner_username", "TEXT")
+    ensure_column(conn, "unmatched_payments", "owner_username", "TEXT")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_whatsapp_number ON users(whatsapp_number) WHERE whatsapp_number IS NOT NULL")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_properties_owner_username ON properties(owner_username)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_unmatched_owner_username ON unmatched_payments(owner_username)")
     conn.commit()

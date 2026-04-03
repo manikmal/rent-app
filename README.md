@@ -37,7 +37,8 @@ Important variables:
 - `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`
   PostgreSQL container credentials
 - `APP_USERS`
-  Format: `user1:password1,user2:password2`
+  Format: `user1:password1[:whatsapp_number],user2:password2[:whatsapp_number]`
+  Example: `admin:secret:919999000001,alice:secret2:919999000002`
 - `APP_SESSION_SECRET`
   Use a long random secret in production
 - `COOKIE_SECURE`
@@ -70,6 +71,8 @@ If you do not provide `APP_USERS`, the app falls back to:
 
 - Username: `admin`
 - Password: `changeme`
+
+If you want WhatsApp-forwarded bank messages to map to the right dashboard user, add that user's WhatsApp number as the optional third field in `APP_USERS`.
 
 Change that before any real deployment.
 

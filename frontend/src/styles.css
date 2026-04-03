@@ -100,6 +100,25 @@ textarea {
   padding: 28px;
 }
 
+.brand-lockup {
+  display: inline-flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.hero-brand-lockup,
+.auth-brand-lockup {
+  margin-bottom: 14px;
+}
+
+.brand-mark {
+  width: 72px;
+  height: 72px;
+  border-radius: 22px;
+  background: rgba(255, 255, 255, 0.75);
+  box-shadow: 0 14px 28px rgba(18, 60, 52, 0.2);
+}
+
 .hero {
   display: flex;
   align-items: flex-end;
@@ -725,6 +744,10 @@ textarea {
 
   .hero {
     align-items: start;
+  }
+
+  .brand-lockup {
+    align-items: flex-start;
   }
 
   .metrics-grid {

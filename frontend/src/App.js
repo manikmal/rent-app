@@ -660,7 +660,12 @@ function App() {
     return (
       <div className="app-shell auth-shell">
         <section className="surface auth-card">
-          <p className="eyebrow">Rent Desk</p>
+          <div className="brand-lockup auth-brand-lockup">
+            <img src="/rent-management-mark.svg" alt="Rent Management" className="brand-mark" />
+            <div>
+              <p className="eyebrow">Rent Management</p>
+            </div>
+          </div>
           <h1>Checking your session...</h1>
         </section>
       </div>
@@ -671,7 +676,12 @@ function App() {
     return (
       <div className="app-shell auth-shell">
         <section className="surface auth-card">
-          <p className="eyebrow">Rent Desk</p>
+          <div className="brand-lockup auth-brand-lockup">
+            <img src="/rent-management-mark.svg" alt="Rent Management" className="brand-mark" />
+            <div>
+              <p className="eyebrow">Rent Management</p>
+            </div>
+          </div>
           <h1>Sign in to manage collections.</h1>
           <p className="hero-copy">
             This small production setup is protected with account-based login before the dashboard loads.
@@ -722,7 +732,12 @@ function App() {
     <div className="app-shell">
       <header className="hero">
         <div className="hero-copy-wrap">
-          <p className="eyebrow">Rent Desk</p>
+          <div className="brand-lockup hero-brand-lockup">
+            <img src="/rent-management-mark.svg" alt="Rent Management" className="brand-mark" />
+            <div>
+              <p className="eyebrow">Rent Management</p>
+            </div>
+          </div>
           <h1>Collections, reminders, and review work in one place.</h1>
           <p className="hero-copy">
             Track rent month by month, review unmatched credits safely, and keep each tenant’s

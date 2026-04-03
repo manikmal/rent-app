@@ -8,6 +8,7 @@ from datetime import date, datetime, timedelta
 from html import escape
 from typing import Any, Dict, List, Optional, Tuple
 
+import httpx
 from fastapi import FastAPI, Form, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -19,6 +20,11 @@ SESSION_MAX_AGE_HOURS = int(os.getenv("SESSION_MAX_AGE_HOURS", "12"))
 SESSION_SECRET = os.getenv("APP_SESSION_SECRET", "change-this-session-secret")
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() == "true"
 APP_USERS_ENV = os.getenv("APP_USERS", "admin:changeme")
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
+TWILIO_API_KEY = os.getenv("TWILIO_API_KEY", "").strip()
+TWILIO_API_SECRET = os.getenv("TWILIO_API_SECRET", "").strip()
+TWILIO_WHATSAPP_FROM = os.getenv("TWILIO_WHATSAPP_FROM", "").strip()
+TWILIO_WHATSAPP_ONBOARDING_CONTENT_SID = os.getenv("TWILIO_WHATSAPP_ONBOARDING_CONTENT_SID", "").strip()
 PUBLIC_PATH_PREFIXES = (
     "/health",
     "/auth/login",
@@ -108,22 +114,205 @@ class WhatsAppInboundPayload(BaseModel):
     profile_name: Optional[str] = None
 
 
-def parse_app_users() -> Dict[str, str]:
-    users: Dict[str, str] = {}
+class WhatsAppOutboundRequest(BaseModel):
+    message: Optional[str] = None
+
+
+def normalize_whatsapp_number(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    digits = "".join(char for char in value if char.isdigit())
+    return digits or None
+
+
+def format_whatsapp_address(value: str) -> str:
+    digits = normalize_whatsapp_number(value)
+    if not digits:
+        raise HTTPException(status_code=400, detail="A valid WhatsApp number is required.")
+    return f"whatsapp:+{digits}"
+
+
+def configured_whatsapp_sender() -> str:
+    if not TWILIO_WHATSAPP_FROM:
+        raise HTTPException(status_code=500, detail="TWILIO_WHATSAPP_FROM is not configured.")
+    sender = TWILIO_WHATSAPP_FROM
+    if not sender.startswith("whatsapp:"):
+        sender = format_whatsapp_address(sender)
+    return sender
+
+
+def send_whatsapp_message(
+    to_number: str,
+    body: str = "",
+    *,
+    content_sid: Optional[str] = None,
+    content_variables: Optional[Dict[str, Any]] = None,
+) -> str:
+    if not TWILIO_ACCOUNT_SID or not TWILIO_API_KEY or not TWILIO_API_SECRET:
+        raise HTTPException(status_code=500, detail="Twilio credentials are not configured.")
+
+    message_body = body.strip()
+    if not content_sid and not message_body:
+        raise HTTPException(status_code=400, detail="Message body cannot be empty.")
+
+    endpoint = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Messages.json"
+    data = {
+        "To": format_whatsapp_address(to_number),
+        "From": configured_whatsapp_sender(),
+    }
+    if content_sid:
+        data["ContentSid"] = content_sid
+        if content_variables:
+            data["ContentVariables"] = json.dumps(content_variables)
+    else:
+        data["Body"] = message_body
+    try:
+        response = httpx.post(
+            endpoint,
+            auth=(TWILIO_API_KEY, TWILIO_API_SECRET),
+            data=data,
+            timeout=20.0,
+        )
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail="Could not reach Twilio.") from exc
+
+    if response.status_code >= 400:
+        try:
+            error_payload = response.json()
+        except ValueError:
+            error_payload = {}
+        detail = error_payload.get("message") or "Twilio rejected the WhatsApp message."
+        raise HTTPException(status_code=502, detail=detail)
+
+    payload = response.json()
+    return str(payload.get("sid") or "")
+
+
+def parse_app_user_configs() -> List[Dict[str, Optional[str]]]:
+    users: List[Dict[str, Optional[str]]] = []
     for item in APP_USERS_ENV.split(","):
         if ":" not in item:
             continue
-        username, password = item.split(":", 1)
+        parts = item.split(":")
+        if len(parts) < 2:
+            continue
+        username = parts[0].strip()
+        password = parts[1].strip()
+        whatsapp_number = normalize_whatsapp_number(":".join(parts[2:]).strip()) if len(parts) > 2 else None
         username = username.strip()
-        password = password.strip()
         if username and password:
-            users[username] = password
+            users.append(
+                {
+                    "username": username,
+                    "password": password,
+                    "whatsapp_number": whatsapp_number,
+                }
+            )
     if not users:
-        users["admin"] = "changeme"
+        users.append(
+            {
+                "username": "admin",
+                "password": "changeme",
+                "whatsapp_number": None,
+            }
+        )
     return users
 
 
-APP_USERS = parse_app_users()
+APP_USER_CONFIGS = parse_app_user_configs()
+APP_USERS = {item["username"]: item["password"] for item in APP_USER_CONFIGS}
+DEFAULT_APP_USERNAME = APP_USER_CONFIGS[0]["username"] or "admin"
+
+
+def get_request_username(request: Request) -> str:
+    return getattr(request.state, "username", None) or require_authenticated_user(request)
+
+
+def get_user_by_username(username: str) -> Optional[Row]:
+    with closing(get_connection()) as conn:
+        return conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+
+
+def update_user_login_tracking(username: str) -> None:
+    with closing(get_connection()) as conn:
+        conn.execute(
+            """
+            UPDATE users
+            SET last_login_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE username = ?
+            """,
+            (username,),
+        )
+        conn.commit()
+
+
+def mark_user_onboarding_sent(username: str) -> None:
+    with closing(get_connection()) as conn:
+        conn.execute(
+            """
+            UPDATE users
+            SET whatsapp_onboarding_sent_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE username = ?
+            """,
+            (username,),
+        )
+        conn.commit()
+
+
+def send_first_login_onboarding(username: str) -> str:
+    user_row = get_user_by_username(username)
+    if not user_row:
+        return "skipped_unknown_user"
+
+    if user_row.get("whatsapp_onboarding_sent_at"):
+        return "already_sent"
+
+    whatsapp_number = user_row.get("whatsapp_number")
+    if not whatsapp_number:
+        return "skipped_no_whatsapp_number"
+
+    if not TWILIO_WHATSAPP_ONBOARDING_CONTENT_SID:
+        return "skipped_missing_template"
+
+    send_whatsapp_message(
+        whatsapp_number,
+        content_sid=TWILIO_WHATSAPP_ONBOARDING_CONTENT_SID,
+    )
+    mark_user_onboarding_sent(username)
+    return "sent"
+
+
+def get_user_by_whatsapp_number(wa_id: Optional[str]) -> Optional[Row]:
+    normalized_wa_id = normalize_whatsapp_number(wa_id)
+    if not normalized_wa_id:
+        return None
+    with closing(get_connection()) as conn:
+        return conn.execute(
+            "SELECT * FROM users WHERE whatsapp_number = ?",
+            (normalized_wa_id,),
+        ).fetchone()
+
+
+def require_owned_property(conn: Connection, property_id: int, owner_username: str) -> Row:
+    row = conn.execute(
+        "SELECT * FROM properties WHERE id = ? AND owner_username = ?",
+        (property_id, owner_username),
+    ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Property not found.")
+    return row
+
+
+def require_owned_unmatched_payment(conn: Connection, unmatched_payment_id: int, owner_username: str) -> Row:
+    row = conn.execute(
+        "SELECT * FROM unmatched_payments WHERE id = ? AND owner_username = ?",
+        (unmatched_payment_id, owner_username),
+    ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Unmatched payment not found.")
+    return row
 
 
 def build_session_token(username: str) -> str:
@@ -164,7 +353,8 @@ def get_authenticated_username(session_token: Optional[str]) -> Optional[str]:
     if datetime.utcnow().timestamp() > expires_ts:
         return None
 
-    if username not in APP_USERS:
+    user_row = get_user_by_username(username)
+    if not user_row:
         return None
 
     return username
@@ -528,42 +718,73 @@ def filter_and_sort_properties(
 
 def all_properties(
     reference_date: date,
+    owner_username: str,
     *,
     query: str = "",
     status: str = "ALL",
     sort: str = "tenant_asc",
 ) -> List[Dict[str, Any]]:
     with closing(get_connection()) as conn:
-        rows = conn.execute("SELECT * FROM properties ORDER BY id DESC").fetchall()
+        rows = conn.execute(
+            "SELECT * FROM properties WHERE owner_username = ? ORDER BY id DESC",
+            (owner_username,),
+        ).fetchall()
         items = [enrich_property(row, reference_date, conn) for row in rows]
     return filter_and_sort_properties(items, query, status, sort)
 
 
-def find_property_by_sender_key(sender_key: Optional[str]) -> Optional[Dict[str, Any]]:
+def find_property_by_sender_key(
+    sender_key: Optional[str],
+    *,
+    owner_username: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
     if not sender_key:
         return None
     with closing(get_connection()) as conn:
-        row = conn.execute(
-            """
-            SELECT p.*
-            FROM tenant_aliases ta
-            JOIN properties p ON p.id = ta.property_id
-            WHERE ta.sender_key = ?
-            """,
-            (sender_key,),
-        ).fetchone()
+        if owner_username is None:
+            row = conn.execute(
+                """
+                SELECT p.*
+                FROM tenant_aliases ta
+                JOIN properties p ON p.id = ta.property_id
+                WHERE ta.sender_key = ?
+                """,
+                (sender_key,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                """
+                SELECT p.*
+                FROM tenant_aliases ta
+                JOIN properties p ON p.id = ta.property_id
+                WHERE ta.sender_key = ?
+                  AND p.owner_username = ?
+                """,
+                (sender_key, owner_username),
+            ).fetchone()
         if not row:
             return None
         return enrich_property(row, date.today(), conn)
 
 
-def candidate_properties(extracted_name: str, reference_date: date) -> List[Dict[str, Any]]:
+def candidate_properties(
+    extracted_name: str,
+    reference_date: date,
+    *,
+    owner_username: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     normalized_target = normalize_name(extracted_name)
     if not normalized_target:
         return []
 
     with closing(get_connection()) as conn:
-        rows = conn.execute("SELECT * FROM properties ORDER BY id DESC").fetchall()
+        if owner_username is None:
+            rows = conn.execute("SELECT * FROM properties ORDER BY id DESC").fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM properties WHERE owner_username = ? ORDER BY id DESC",
+                (owner_username,),
+            ).fetchall()
         matches: List[Dict[str, Any]] = []
         for row in rows:
             tenant_name = normalize_name(row["tenant_name"])
@@ -677,11 +898,14 @@ def save_unmatched_payment(
     amount: float,
     payment_date: str,
     candidates: List[Dict[str, Any]],
+    *,
+    owner_username: Optional[str],
 ) -> int:
     with closing(get_connection()) as conn:
         cursor = conn.execute(
             """
             INSERT INTO unmatched_payments (
+                owner_username,
                 raw_message,
                 extracted_tenant_name,
                 sender_key,
@@ -689,9 +913,10 @@ def save_unmatched_payment(
                 payment_date,
                 candidates_json
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
+                owner_username,
                 message,
                 extracted_name,
                 sender_key,
@@ -709,14 +934,21 @@ def set_unmatched_payment_status(
     unmatched_payment_id: int,
     status: str,
     *,
+    owner_username: Optional[str] = None,
     note: Optional[str] = None,
     matched_property_id: Optional[int] = None,
     matched_payment_id: Optional[int] = None,
 ) -> None:
-    existing = conn.execute(
-        "SELECT * FROM unmatched_payments WHERE id = ?",
-        (unmatched_payment_id,),
-    ).fetchone()
+    if owner_username is None:
+        existing = conn.execute(
+            "SELECT * FROM unmatched_payments WHERE id = ?",
+            (unmatched_payment_id,),
+        ).fetchone()
+    else:
+        existing = conn.execute(
+            "SELECT * FROM unmatched_payments WHERE id = ? AND owner_username = ?",
+            (unmatched_payment_id, owner_username),
+        ).fetchone()
     if not existing:
         raise HTTPException(status_code=404, detail="Unmatched payment not found.")
 
@@ -771,6 +1003,7 @@ def create_payment(
     amount: float,
     payment_date: str,
     *,
+    owner_username: Optional[str] = None,
     source: str,
     sender_key: Optional[str] = None,
     raw_message: Optional[str] = None,
@@ -781,7 +1014,13 @@ def create_payment(
     normalized_date = parse_iso_date(payment_date, "Payment date")
 
     with closing(get_connection()) as conn:
-        property_row = conn.execute("SELECT * FROM properties WHERE id = ?", (property_id,)).fetchone()
+        if owner_username is None:
+            property_row = conn.execute("SELECT * FROM properties WHERE id = ?", (property_id,)).fetchone()
+        else:
+            property_row = conn.execute(
+                "SELECT * FROM properties WHERE id = ? AND owner_username = ?",
+                (property_id, owner_username),
+            ).fetchone()
         if not property_row:
             raise HTTPException(status_code=404, detail="Property not found.")
 
@@ -818,6 +1057,7 @@ def create_payment(
                 conn,
                 unmatched_payment_id,
                 "MATCHED",
+                owner_username=owner_username,
                 note=note,
                 matched_property_id=property_id,
                 matched_payment_id=payment_id,
@@ -840,7 +1080,7 @@ def create_payment(
     }
 
 
-def process_payment_message(message: str) -> Dict[str, Any]:
+def process_payment_message(message: str, *, owner_username: Optional[str] = None) -> Dict[str, Any]:
     try:
         amount = parse_amount(message)
         payment_date = parse_payment_date(message)
@@ -848,12 +1088,16 @@ def process_payment_message(message: str) -> Dict[str, Any]:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    matched_by_alias = find_property_by_sender_key(sender_details["sender_key"])
+    matched_by_alias = find_property_by_sender_key(
+        sender_details["sender_key"],
+        owner_username=owner_username,
+    )
     if matched_by_alias:
         result = create_payment(
             int(matched_by_alias["id"]),
             amount,
             payment_date,
+            owner_username=owner_username,
             source="auto_alias",
             sender_key=sender_details["sender_key"],
             raw_message=message,
@@ -877,8 +1121,14 @@ def process_payment_message(message: str) -> Dict[str, Any]:
         }
 
     reference_date = month_start(datetime.strptime(payment_date, "%Y-%m-%d").date())
-    candidates = candidate_properties(sender_details["sender_name"] or "", reference_date)
-    fallback_candidates = candidates or all_properties(reference_date)
+    candidates = candidate_properties(
+        sender_details["sender_name"] or "",
+        reference_date,
+        owner_username=owner_username,
+    )
+    fallback_candidates = candidates or (
+        all_properties(reference_date, owner_username) if owner_username is not None else []
+    )
     unmatched_id = save_unmatched_payment(
         message,
         sender_details["sender_name"] or "",
@@ -886,6 +1136,7 @@ def process_payment_message(message: str) -> Dict[str, Any]:
         amount,
         payment_date,
         fallback_candidates,
+        owner_username=owner_username,
     )
     return {
         "status": "UNMATCHED",
@@ -904,6 +1155,7 @@ def manual_match_payment(
     amount: float,
     normalized_date: str,
     *,
+    owner_username: Optional[str] = None,
     unmatched_payment_id: Optional[int] = None,
     sender_key: Optional[str] = None,
     raw_message: Optional[str] = None,
@@ -913,6 +1165,7 @@ def manual_match_payment(
         property_id,
         amount,
         normalized_date,
+        owner_username=owner_username,
         source="manual_match",
         sender_key=sender_key,
         raw_message=raw_message,
@@ -932,9 +1185,12 @@ def manual_match_payment(
     }
 
 
-def build_monthly_trends(reference_date: date) -> List[Dict[str, Any]]:
+def build_monthly_trends(reference_date: date, owner_username: str) -> List[Dict[str, Any]]:
     with closing(get_connection()) as conn:
-        property_rows = conn.execute("SELECT * FROM properties").fetchall()
+        property_rows = conn.execute(
+            "SELECT * FROM properties WHERE owner_username = ?",
+            (owner_username,),
+        ).fetchall()
         trends: List[Dict[str, Any]] = []
         for offset in range(5, -1, -1):
             month_ref = add_months(month_start(reference_date), -offset)
@@ -954,8 +1210,9 @@ def build_monthly_trends(reference_date: date) -> List[Dict[str, Any]]:
                 SELECT COUNT(*) AS total
                 FROM unmatched_payments
                 WHERE to_char(payment_date, 'YYYY-MM') = ?
+                  AND owner_username = ?
                 """,
-                (format_month(month_ref),),
+                (format_month(month_ref), owner_username),
             ).fetchone()
             trends.append(
                 {
@@ -969,7 +1226,12 @@ def build_monthly_trends(reference_date: date) -> List[Dict[str, Any]]:
         return trends
 
 
-def build_reminders(reference_date: date, properties: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def build_reminders(
+    reference_date: date,
+    properties: List[Dict[str, Any]],
+    *,
+    owner_username: str,
+) -> List[Dict[str, Any]]:
     reminders: List[Dict[str, Any]] = []
     today = date.today()
 
@@ -1029,7 +1291,10 @@ def build_reminders(reference_date: date, properties: List[Dict[str, Any]]) -> L
             SELECT COUNT(*) AS total
             FROM unmatched_payments
             WHERE status = 'UNMATCHED'
+              AND owner_username = ?
             """
+            ,
+            (owner_username,),
         ).fetchone()
     if int(unmatched_open["total"] or 0) > 0:
         reminders.append(
@@ -1060,11 +1325,11 @@ def build_attention_items(properties: List[Dict[str, Any]]) -> List[Dict[str, An
     return items[:6]
 
 
-def build_dashboard(reference_date: date) -> Dict[str, Any]:
-    properties = all_properties(reference_date)
-    reminders = build_reminders(reference_date, properties)
+def build_dashboard(reference_date: date, owner_username: str) -> Dict[str, Any]:
+    properties = all_properties(reference_date, owner_username)
+    reminders = build_reminders(reference_date, properties, owner_username=owner_username)
     attention_items = build_attention_items(properties)
-    trends = build_monthly_trends(reference_date)
+    trends = build_monthly_trends(reference_date, owner_username)
 
     return {
         "period": format_month(reference_date),
@@ -1073,7 +1338,13 @@ def build_dashboard(reference_date: date) -> Dict[str, Any]:
             "collected": round(sum(float(item["current_month_paid_amount"]) for item in properties), 2),
             "outstanding": round(sum(float(item["balance_amount"]) for item in properties), 2),
             "surplus": round(sum(float(item["surplus_amount"]) for item in properties), 2),
-            "unmatched": len([item for item in get_unmatched_payments() if item["status"] == "UNMATCHED"]),
+            "unmatched": len(
+                [
+                    item
+                    for item in get_unmatched_payments(owner_username=owner_username)
+                    if item["status"] == "UNMATCHED"
+                ]
+            ),
             "needs_attention": len(attention_items),
         },
         "reminders": reminders,
@@ -1126,17 +1397,25 @@ def validate_property_payload(payload: PropertyCreateRequest) -> Dict[str, Any]:
     }
 
 
-def get_unmatched_payments(status: str = "UNMATCHED") -> List[Dict[str, Any]]:
+def get_unmatched_payments(
+    status: str = "UNMATCHED",
+    *,
+    owner_username: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     with closing(get_connection()) as conn:
-        params: Tuple[Any, ...]
+        params: List[Any] = []
         query = "SELECT * FROM unmatched_payments"
+        filters: List[str] = []
+        if owner_username is not None:
+            filters.append("owner_username = ?")
+            params.append(owner_username)
         if status and status.upper() != "ALL":
-            query += " WHERE status = ?"
-            params = (status.upper(),)
-        else:
-            params = ()
+            filters.append("status = ?")
+            params.append(status.upper())
+        if filters:
+            query += " WHERE " + " AND ".join(filters)
         query += " ORDER BY payment_date DESC, id DESC"
-        rows = conn.execute(query, params).fetchall()
+        rows = conn.execute(query, tuple(params)).fetchall()
 
     items = []
     for row in rows:
@@ -1252,6 +1531,10 @@ def handle_whatsapp_selection(body: str, wa_id: str) -> Optional[str]:
     pending = get_whatsapp_pending_match(wa_id)
     if not pending:
         return None
+    whatsapp_user = get_user_by_whatsapp_number(wa_id)
+    if not whatsapp_user:
+        clear_whatsapp_pending_match(wa_id)
+        return "This WhatsApp number is no longer linked to an app user. Please reconfigure the user and try again."
 
     normalized = body.strip().upper()
     if normalized == "CANCEL":
@@ -1267,10 +1550,14 @@ def handle_whatsapp_selection(body: str, wa_id: str) -> Optional[str]:
         return "That option is not in the list. Reply with a valid tenant number, or reply CANCEL."
 
     candidate = candidates[selected_index]
+    if candidate.get("owner_username") != whatsapp_user["username"]:
+        clear_whatsapp_pending_match(wa_id)
+        return "That pending match does not belong to this app user anymore. Please resend the bank message."
     result = manual_match_payment(
         property_id=int(candidate["id"]),
         amount=float(pending["amount"]),
         normalized_date=pending["payment_date"],
+        owner_username=whatsapp_user["username"],
         unmatched_payment_id=pending.get("unmatched_payment_id"),
         sender_key=pending.get("sender_key"),
         raw_message=pending.get("original_message"),
@@ -1285,13 +1572,18 @@ def process_whatsapp_message(payload: WhatsAppInboundPayload) -> str:
     if not body:
         return "Send the bank credit message text exactly as received, or reply with a tenant number if I asked you to choose."
 
+    whatsapp_user = get_user_by_whatsapp_number(payload.wa_id) if payload.wa_id else None
+    if payload.wa_id and not whatsapp_user:
+        return "This WhatsApp number is not linked to any app user yet. Add the user's WhatsApp number in the app config first."
+    owner_username = whatsapp_user["username"] if whatsapp_user else None
+
     if payload.wa_id:
         selection_reply = handle_whatsapp_selection(body, payload.wa_id)
         if selection_reply:
             return selection_reply
 
     try:
-        result = process_payment_message(body)
+        result = process_payment_message(body, owner_username=owner_username)
     except HTTPException as exc:
         return str(exc.detail)
 
@@ -1299,6 +1591,9 @@ def process_whatsapp_message(payload: WhatsAppInboundPayload) -> str:
         return summarize_match(result)
 
     candidates = result.get("candidates", [])[:9]
+    candidate_owners = {item.get("owner_username") for item in candidates if item.get("owner_username")}
+    if len(candidate_owners) > 1:
+        candidates = []
     if payload.wa_id and candidates:
         save_whatsapp_pending_match(
             wa_id=payload.wa_id,
@@ -1315,9 +1610,65 @@ def process_whatsapp_message(payload: WhatsAppInboundPayload) -> str:
     return "I could not auto-match this payment, and there were no tenant options to suggest. Please review it in the dashboard."
 
 
+def sync_users_from_config() -> None:
+    with closing(get_connection()) as conn:
+        for user in APP_USER_CONFIGS:
+            conn.execute(
+                """
+                INSERT INTO users (username, password, whatsapp_number, last_login_at, whatsapp_onboarding_sent_at)
+                VALUES (?, ?, ?, NULL, NULL)
+                ON CONFLICT(username) DO UPDATE SET
+                    password = excluded.password,
+                    whatsapp_number = excluded.whatsapp_number,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    user["username"],
+                    user["password"],
+                    user["whatsapp_number"],
+                ),
+            )
+        conn.commit()
+
+
+def backfill_owner_usernames() -> None:
+    with closing(get_connection()) as conn:
+        conn.execute(
+            """
+            UPDATE properties
+            SET owner_username = ?
+            WHERE owner_username IS NULL OR owner_username = ''
+            """,
+            (DEFAULT_APP_USERNAME,),
+        )
+        conn.execute(
+            """
+            UPDATE unmatched_payments
+            SET owner_username = ?
+            WHERE owner_username IS NULL
+              AND matched_property_id IS NOT NULL
+              AND matched_property_id IN (
+                  SELECT id FROM properties WHERE owner_username = ?
+              )
+            """,
+            (DEFAULT_APP_USERNAME, DEFAULT_APP_USERNAME),
+        )
+        conn.execute(
+            """
+            UPDATE unmatched_payments
+            SET owner_username = ?
+            WHERE owner_username IS NULL OR owner_username = ''
+            """,
+            (DEFAULT_APP_USERNAME,),
+        )
+        conn.commit()
+
+
 @app.on_event("startup")
 def startup() -> None:
     init_db()
+    sync_users_from_config()
+    backfill_owner_usernames()
     with closing(get_connection()) as conn:
         property_rows = conn.execute("SELECT id FROM properties").fetchall()
         for row in property_rows:
@@ -1330,9 +1681,16 @@ def login(payload: LoginRequest, response: Response) -> Dict[str, Any]:
     username = payload.username.strip()
     password = payload.password
 
-    expected_password = APP_USERS.get(username)
+    user_row = get_user_by_username(username)
+    expected_password = user_row["password"] if user_row else None
     if not expected_password or expected_password != password:
         raise HTTPException(status_code=401, detail="Invalid username or password.")
+
+    first_login = not user_row.get("last_login_at")
+    onboarding_status = "not_attempted"
+    if first_login:
+        onboarding_status = send_first_login_onboarding(username)
+    update_user_login_tracking(username)
 
     response.set_cookie(
         key=SESSION_COOKIE_NAME,
@@ -1343,7 +1701,11 @@ def login(payload: LoginRequest, response: Response) -> Dict[str, Any]:
         max_age=SESSION_MAX_AGE_HOURS * 3600,
         path="/",
     )
-    return {"username": username}
+    return {
+        "username": username,
+        "first_login": first_login,
+        "whatsapp_onboarding_status": onboarding_status,
+    }
 
 
 @app.post("/auth/logout")
@@ -1367,36 +1729,42 @@ def health() -> Dict[str, str]:
 
 
 @app.get("/dashboard")
-def dashboard(month: Optional[str] = None) -> Dict[str, Any]:
+def dashboard(request: Request, month: Optional[str] = None) -> Dict[str, Any]:
+    username = get_request_username(request)
     reference_date = parse_month_reference(month)
-    return build_dashboard(reference_date)
+    return build_dashboard(reference_date, username)
 
 
 @app.get("/reminders")
-def reminders(month: Optional[str] = None) -> List[Dict[str, Any]]:
+def reminders(request: Request, month: Optional[str] = None) -> List[Dict[str, Any]]:
+    username = get_request_username(request)
     reference_date = parse_month_reference(month)
-    properties = all_properties(reference_date)
-    return build_reminders(reference_date, properties)
+    properties = all_properties(reference_date, username)
+    return build_reminders(reference_date, properties, owner_username=username)
 
 
 @app.get("/properties")
 def get_properties(
+    request: Request,
     month: Optional[str] = None,
     q: str = "",
     status: str = "ALL",
     sort: str = "tenant_asc",
 ) -> List[Dict[str, Any]]:
+    username = get_request_username(request)
     reference_date = parse_month_reference(month)
-    return all_properties(reference_date, query=q, status=status, sort=sort)
+    return all_properties(reference_date, username, query=q, status=status, sort=sort)
 
 
 @app.get("/properties/{property_id}/ledger")
 def get_property_ledger(
+    request: Request,
     property_id: int,
     month: Optional[str] = None,
     history_from: Optional[str] = None,
     history_to: Optional[str] = None,
 ) -> Dict[str, Any]:
+    username = get_request_username(request)
     reference_date = parse_month_reference(month)
     normalized_history_from = parse_iso_date(history_from, "History from") if history_from else None
     normalized_history_to = parse_iso_date(history_to, "History to") if history_to else None
@@ -1404,9 +1772,7 @@ def get_property_ledger(
         raise HTTPException(status_code=400, detail="History to must be on or after history from.")
 
     with closing(get_connection()) as conn:
-        property_row = conn.execute("SELECT * FROM properties WHERE id = ?", (property_id,)).fetchone()
-        if not property_row:
-            raise HTTPException(status_code=404, detail="Property not found.")
+        property_row = require_owned_property(conn, property_id, username)
 
         summary = enrich_property(property_row, reference_date, conn)
         payment_history = get_payment_history_for_property(
@@ -1418,7 +1784,9 @@ def get_property_ledger(
         monthly_history = build_monthly_history(conn, property_row, reference_date=reference_date)
 
     tenant_reminders = [
-        item for item in build_reminders(reference_date, [summary]) if item.get("property_id") == property_id
+        item
+        for item in build_reminders(reference_date, [summary], owner_username=username)
+        if item.get("property_id") == property_id
     ]
     return {
         "property": summary,
@@ -1434,13 +1802,15 @@ def get_property_ledger(
 
 
 @app.post("/properties")
-def create_property(payload: PropertyCreateRequest) -> Dict[str, Any]:
+def create_property(request: Request, payload: PropertyCreateRequest) -> Dict[str, Any]:
+    username = get_request_username(request)
     data = validate_property_payload(payload)
 
     with closing(get_connection()) as conn:
         cursor = conn.execute(
             """
             INSERT INTO properties (
+                owner_username,
                 tenant_name,
                 property_name,
                 rent_amount,
@@ -1459,9 +1829,10 @@ def create_property(payload: PropertyCreateRequest) -> Dict[str, Any]:
                 last_payment_amount,
                 current_month_paid_amount
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', NULL, NULL, 0)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', NULL, NULL, 0)
             """,
             (
+                username,
                 data["tenant_name"],
                 data["property_name"],
                 data["rent_amount"],
@@ -1486,13 +1857,12 @@ def create_property(payload: PropertyCreateRequest) -> Dict[str, Any]:
 
 
 @app.put("/properties/{property_id}")
-def update_property(property_id: int, payload: PropertyCreateRequest) -> Dict[str, Any]:
+def update_property(request: Request, property_id: int, payload: PropertyCreateRequest) -> Dict[str, Any]:
+    username = get_request_username(request)
     data = validate_property_payload(payload)
 
     with closing(get_connection()) as conn:
-        existing_row = conn.execute("SELECT * FROM properties WHERE id = ?", (property_id,)).fetchone()
-        if not existing_row:
-            raise HTTPException(status_code=404, detail="Property not found.")
+        require_owned_property(conn, property_id, username)
 
         conn.execute(
             """
@@ -1537,11 +1907,10 @@ def update_property(property_id: int, payload: PropertyCreateRequest) -> Dict[st
 
 
 @app.delete("/properties/{property_id}")
-def delete_property(property_id: int) -> Dict[str, Any]:
+def delete_property(request: Request, property_id: int) -> Dict[str, Any]:
+    username = get_request_username(request)
     with closing(get_connection()) as conn:
-        existing_row = conn.execute("SELECT id FROM properties WHERE id = ?", (property_id,)).fetchone()
-        if not existing_row:
-            raise HTTPException(status_code=404, detail="Property not found.")
+        require_owned_property(conn, property_id, username)
 
         conn.execute("DELETE FROM rent_increases WHERE property_id = ?", (property_id,))
         conn.execute("DELETE FROM tenant_aliases WHERE property_id = ?", (property_id,))
@@ -1552,36 +1921,36 @@ def delete_property(property_id: int) -> Dict[str, Any]:
 
 
 @app.get("/unmatched-payments")
-def unmatched_payments(status: str = "UNMATCHED") -> List[Dict[str, Any]]:
-    return get_unmatched_payments(status=status)
+def unmatched_payments(request: Request, status: str = "UNMATCHED") -> List[Dict[str, Any]]:
+    username = get_request_username(request)
+    return get_unmatched_payments(status=status, owner_username=username)
 
 
 @app.post("/process-payment")
-def process_payment(payload: PaymentRequest) -> Dict[str, Any]:
-    return process_payment_message(payload.message)
+def process_payment(request: Request, payload: PaymentRequest) -> Dict[str, Any]:
+    username = get_request_username(request)
+    return process_payment_message(payload.message, owner_username=username)
 
 
 @app.post("/manual-match")
-def manual_match(payload: ManualMatchRequest) -> Dict[str, Any]:
+def manual_match(request: Request, payload: ManualMatchRequest) -> Dict[str, Any]:
+    username = get_request_username(request)
     normalized_date = parse_iso_date(payload.date, "Date")
     return manual_match_payment(
         property_id=payload.property_id,
         amount=payload.amount,
         normalized_date=normalized_date,
+        owner_username=username,
         unmatched_payment_id=payload.unmatched_payment_id,
         sender_key=payload.sender_key,
     )
 
 
 @app.post("/unmatched-payments/{unmatched_payment_id}/match")
-def review_match(unmatched_payment_id: int, payload: InboxMatchRequest) -> Dict[str, Any]:
+def review_match(request: Request, unmatched_payment_id: int, payload: InboxMatchRequest) -> Dict[str, Any]:
+    username = get_request_username(request)
     with closing(get_connection()) as conn:
-        unmatched_row = conn.execute(
-            "SELECT * FROM unmatched_payments WHERE id = ?",
-            (unmatched_payment_id,),
-        ).fetchone()
-        if not unmatched_row:
-            raise HTTPException(status_code=404, detail="Unmatched payment not found.")
+        unmatched_row = require_owned_unmatched_payment(conn, unmatched_payment_id, username)
         if unmatched_row["status"] != "UNMATCHED":
             raise HTTPException(status_code=400, detail="This payment has already been reviewed.")
 
@@ -1589,6 +1958,7 @@ def review_match(unmatched_payment_id: int, payload: InboxMatchRequest) -> Dict[
         property_id=payload.property_id,
         amount=float(unmatched_row["amount"]),
         normalized_date=unmatched_row["payment_date"],
+        owner_username=username,
         unmatched_payment_id=unmatched_payment_id,
         sender_key=payload.sender_key or unmatched_row["sender_key"],
         raw_message=unmatched_row["raw_message"],
@@ -1599,14 +1969,17 @@ def review_match(unmatched_payment_id: int, payload: InboxMatchRequest) -> Dict[
 
 @app.post("/unmatched-payments/{unmatched_payment_id}/reject")
 def reject_unmatched_payment(
+    request: Request,
     unmatched_payment_id: int,
     payload: ReviewDecisionRequest,
 ) -> Dict[str, Any]:
+    username = get_request_username(request)
     with closing(get_connection()) as conn:
         set_unmatched_payment_status(
             conn,
             unmatched_payment_id,
             "REJECTED",
+            owner_username=username,
             note=payload.note or "Rejected from dashboard.",
         )
         conn.commit()
@@ -1615,14 +1988,17 @@ def reject_unmatched_payment(
 
 @app.post("/unmatched-payments/{unmatched_payment_id}/duplicate")
 def mark_duplicate_unmatched_payment(
+    request: Request,
     unmatched_payment_id: int,
     payload: ReviewDecisionRequest,
 ) -> Dict[str, Any]:
+    username = get_request_username(request)
     with closing(get_connection()) as conn:
         set_unmatched_payment_status(
             conn,
             unmatched_payment_id,
             "DUPLICATE",
+            owner_username=username,
             note=payload.note or "Marked as duplicate from dashboard.",
         )
         conn.commit()
@@ -1630,9 +2006,19 @@ def mark_duplicate_unmatched_payment(
 
 
 @app.post("/payments/{payment_id}/undo")
-def undo_payment(payment_id: int, payload: UndoPaymentRequest) -> Dict[str, Any]:
+def undo_payment(request: Request, payment_id: int, payload: UndoPaymentRequest) -> Dict[str, Any]:
+    username = get_request_username(request)
     with closing(get_connection()) as conn:
-        payment_row = conn.execute("SELECT * FROM payments WHERE id = ?", (payment_id,)).fetchone()
+        payment_row = conn.execute(
+            """
+            SELECT pay.*
+            FROM payments pay
+            JOIN properties p ON p.id = pay.property_id
+            WHERE pay.id = ?
+              AND p.owner_username = ?
+            """,
+            (payment_id, username),
+        ).fetchone()
         if not payment_row:
             raise HTTPException(status_code=404, detail="Payment not found.")
         if payment_row["status"] != "POSTED":
@@ -1659,17 +2045,15 @@ def undo_payment(payment_id: int, payload: UndoPaymentRequest) -> Dict[str, Any]
                     resolution_note = NULL,
                     reviewed_at = NULL
                 WHERE id = ?
+                  AND owner_username = ?
                 """,
-                (payment_row["unmatched_payment_id"],),
+                (payment_row["unmatched_payment_id"], username),
             )
 
         sync_property_cache(conn, int(payment_row["property_id"]))
         conn.commit()
 
-        property_row = conn.execute(
-            "SELECT * FROM properties WHERE id = ?",
-            (payment_row["property_id"],),
-        ).fetchone()
+        property_row = require_owned_property(conn, int(payment_row["property_id"]), username)
         summary = enrich_property(property_row, date.today().replace(day=1), conn)
 
     return {
@@ -1677,6 +2061,39 @@ def undo_payment(payment_id: int, payload: UndoPaymentRequest) -> Dict[str, Any]
         "payment_id": payment_id,
         "property_id": payment_row["property_id"],
         "matched_property": summary,
+    }
+
+
+@app.post("/whatsapp/onboarding")
+def send_whatsapp_onboarding(
+    request: Request,
+    payload: WhatsAppOutboundRequest,
+) -> Dict[str, Any]:
+    username = get_request_username(request)
+    user_row = get_user_by_username(username)
+    whatsapp_number = user_row["whatsapp_number"] if user_row else None
+    if not whatsapp_number:
+        raise HTTPException(status_code=400, detail="No WhatsApp number is linked to this app user.")
+
+    message = clean_optional_text(payload.message)
+    if message:
+        message_sid = send_whatsapp_message(whatsapp_number, message)
+    else:
+        if not TWILIO_WHATSAPP_ONBOARDING_CONTENT_SID:
+            raise HTTPException(
+                status_code=400,
+                detail="Set TWILIO_WHATSAPP_ONBOARDING_CONTENT_SID to send onboarding outside an active WhatsApp conversation.",
+            )
+        message_sid = send_whatsapp_message(
+            whatsapp_number,
+            content_sid=TWILIO_WHATSAPP_ONBOARDING_CONTENT_SID,
+        )
+        mark_user_onboarding_sent(username)
+    return {
+        "status": "sent",
+        "to": format_whatsapp_address(whatsapp_number),
+        "message": message or "template_onboarding",
+        "sid": message_sid,
     }
 
 

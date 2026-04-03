@@ -54,7 +54,7 @@ Recommended values:
 DOMAIN=rent.yourdomain.com
 SITE_ADDRESS=rent.yourdomain.com
 POSTGRES_PASSWORD=change-this
-APP_USERS=admin:change-this
+APP_USERS=admin:change-this:919999000001
 APP_SESSION_SECRET=replace-with-a-long-random-secret
 COOKIE_SECURE=true
 ALLOW_ORIGINS=https://rent.yourdomain.com
